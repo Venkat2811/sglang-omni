@@ -61,10 +61,81 @@ _CODEC_CACHE: dict[tuple[str, str, str], CsmMimiCodec] = {}
 
 
 def resolve_checkpoint(checkpoint: str) -> str:
-    """Local dir or HF repo id → local snapshot path (verbatim higgs copy)."""
+    """Local dir or HF repo id → local snapshot path, curated to the
+    HF-transformers export when the snapshot mixes checkpoint formats."""
     if Path(checkpoint).is_dir():
-        return checkpoint
-    return snapshot_download(checkpoint)
+        snapshot = Path(checkpoint)
+    else:
+        snapshot = Path(snapshot_download(checkpoint))
+    return str(_stage_transformers_only_view(snapshot))
+
+
+_TF_INDEX_NAME = "transformers.safetensors.index.json"
+_TF_SHARD_PREFIX = "transformers-"
+
+
+def _stage_transformers_only_view(snapshot: Path) -> Path:
+    """Expose ONLY the HF-transformers export to the sglang weight loader.
+
+    The sesame/csm-1b snapshot can contain BOTH the orig-format
+    ``model.safetensors`` (un-permuted-RoPE Q/K — must never be read, PLAN
+    §8.R2) and the ``transformers-*.safetensors`` shards. sglang's
+    ``DefaultModelLoader`` globs ``*.safetensors``, so a mixed snapshot feeds
+    orig-format tensors into the strict remap census (and would corrupt Q/K
+    if they were ever mapped). Stage a symlink view with the transformers
+    shards renamed to canonical ``model-0000i-of-0000n.safetensors`` plus a
+    rewritten ``model.safetensors.index.json`` so the loader's index filter
+    selects exactly the 538-tensor ship artifact. ``audio_codec.py`` falls
+    back to the rewritten index name, and tokenizer/config sidecars are
+    symlinked through unchanged.
+    """
+    tf_index = snapshot / _TF_INDEX_NAME
+    if not tf_index.exists():
+        return snapshot  # plain layout (e.g. a clean export dir): nothing to do
+    import hashlib
+    import json
+
+    view = (
+        Path.home()
+        / ".cache"
+        / "sglang_omni"
+        / "csm_tfview"
+        / hashlib.sha256(str(snapshot.resolve()).encode()).hexdigest()[:16]
+    )
+    view.mkdir(parents=True, exist_ok=True)
+
+    with open(tf_index) as f:
+        index = json.load(f)
+    rename = {
+        shard: (
+            "model-" + shard[len(_TF_SHARD_PREFIX) :]
+            if shard.startswith(_TF_SHARD_PREFIX)
+            else shard
+        )
+        for shard in sorted(set(index["weight_map"].values()))
+    }
+    index["weight_map"] = {k: rename[v] for k, v in index["weight_map"].items()}
+
+    def _link(dst: Path, src: Path) -> None:
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+        dst.symlink_to(src.resolve())
+
+    for src_name, dst_name in rename.items():
+        _link(view / dst_name, snapshot / src_name)
+    for entry in snapshot.iterdir():
+        name = entry.name
+        if name == _TF_INDEX_NAME or name in rename:
+            continue
+        if name.endswith((".safetensors", ".bin", ".pt", ".pth")) or name in (
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        ):
+            continue  # orig-format weights / stale indexes stay OUT of the view
+        _link(view / name, entry)
+    with open(view / "model.safetensors.index.json", "w") as f:
+        json.dump(index, f)
+    return view
 
 
 def get_or_load_codec(checkpoint_dir: str, device: str, dtype: str) -> CsmMimiCodec:
