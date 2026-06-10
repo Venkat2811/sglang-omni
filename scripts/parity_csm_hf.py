@@ -366,14 +366,19 @@ def generate_engine_frames(
     checkpoint_dir = resolve_checkpoint(model_path)
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
+    engine_fp32 = engine_dtype == "float32"
     server_args = build_sglang_server_args(
         checkpoint_dir,
         context_length=BACKBONE_CTX,
         chunked_prefill_size=BACKBONE_CTX,
         max_running_requests=4,
-        mem_fraction_static=0.5,
+        # fp32 doubles the weight footprint (0.5 OOMs the pool on 12 GB), and
+        # flashinfer has no fp32 QKV kernels — the fp32 structural gate runs
+        # torch-native SDPA instead (eager B=1; perf is irrelevant here).
+        mem_fraction_static=0.8 if engine_fp32 else 0.5,
         disable_cuda_graph=True,  # the M2 gate runs the eager baseline
         dtype=engine_dtype,
+        **({"attention_backend": "torch_native"} if engine_fp32 else {}),
     )
     server_args.disable_overlap_schedule = True
 
@@ -580,8 +585,12 @@ def compare_runs(
         "num_failed": sum(1 for p in per_prompt if not p["passed"]),
         "note": (
             "exact-match gate over the first N frames at greedy/temp=0 both "
-            "levels (PLAN 6.2; the bf16 ship gate tolerates divergence only "
-            "past frame 25 — raise --frames to probe it)"
+            "levels (PLAN 6.2). The STRUCTURAL gate is --engine-dtype "
+            "float32: measured fp32 top-2 margins inside the first 10 frames "
+            "go down to ~3e-4, and HF's OWN bf16 run diverges from its fp32 "
+            "run at frame 0-1 (same sites/codes as our bf16 engine), so "
+            "bf16-vs-fp32 exact match is unachievable for ANY bf16 "
+            "implementation — bf16 results here are telemetry, not a gate."
         ),
     }
     return {"passed": all_passed, "per_prompt": per_prompt, "summary": summary}
