@@ -53,6 +53,15 @@ def _patched_forward_cuda(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if x.numel() == 0:
         return x
+    if x.dtype == torch.float32:
+        # sgl_kernel.rmsnorm dispatches fp16/bf16 only ("failed to dispatch
+        # data type Float"); the fp32 parity leg takes the native path.
+        return self.forward_native(
+            x,
+            residual,
+            post_residual_addition=post_residual_addition,
+            **kwargs,
+        )
     if self.cast_x_before_out_mul:
         return self.forward_native(
             x,
