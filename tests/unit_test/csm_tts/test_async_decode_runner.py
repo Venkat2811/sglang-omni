@@ -11,7 +11,9 @@ from __future__ import annotations
 import pytest
 
 pytestmark = pytest.mark.skip(
-    reason="csm_tts skeleton — async decode lands with M4 (PLAN §6.1/§7)"
+    reason="deliberate M4 deferral: async decode is implemented but dormant "
+    "(enable_async_decode=False through M3); these tests land with the M4 "
+    "CUDA-graph milestone and need CUDA events + pinned memory (PLAN §6.1/§7)"
 )
 
 

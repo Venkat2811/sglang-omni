@@ -24,10 +24,19 @@ from sglang_omni.models.csm_tts.utils import (
 __all__ = [
     "CsmBatchedSamplerState",
     "K_MAX",
+    "STAGING_WIDTH",
     "frame_finalize_direct",
     "sample_codes_batched",
     "step_reference",
 ]
+
+# Greedy short-circuit threshold (higgs sampler.py parity).
+_GREEDY_TEMP_THRESHOLD = 1e-5
+
+# Packed D2H staging row layout (PLAN §2.6): ``[c0..c31 | was_done |
+# generation_done]`` int64 — model.py allocates ``_cg_collect_staging
+# [P, STAGING_WIDTH]``; one blocking D2H per decode step pulls everything.
+STAGING_WIDTH = NUM_CODEBOOKS + 2
 
 
 class CsmBatchedSamplerState:
@@ -48,12 +57,24 @@ class CsmBatchedSamplerState:
     def __init__(self, pool_size: int, device: torch.device | str = "cuda") -> None:
         """Allocate ``last_codes [P, 32]`` int64, ``generation_done [P]`` bool,
         ``frames_emitted [P]`` int32 on ``device``."""
-        raise NotImplementedError("skeleton — PLAN §1.5 CsmBatchedSamplerState.__init__")
+        self.pool_size = int(pool_size)
+        self.device = torch.device(device)
+        self.last_codes = torch.zeros(
+            self.pool_size, NUM_CODEBOOKS, dtype=torch.int64, device=self.device
+        )
+        self.generation_done = torch.zeros(
+            self.pool_size, dtype=torch.bool, device=self.device
+        )
+        self.frames_emitted = torch.zeros(
+            self.pool_size, dtype=torch.int32, device=self.device
+        )
 
     def reset_row(self, row: int) -> None:
         """Reset one pool row to the fresh-request state
         (``last_codes=0``, ``generation_done=False``, ``frames_emitted=0``)."""
-        raise NotImplementedError("skeleton — PLAN §1.5 CsmBatchedSamplerState.reset_row")
+        self.last_codes[row].zero_()
+        self.generation_done[row] = False
+        self.frames_emitted[row] = 0
 
 
 def sample_codes_batched(
@@ -79,7 +100,43 @@ def sample_codes_batched(
     Returns:
         int64 ``[B]`` sampled codes in ``[0, 2050]``.
     """
-    raise NotImplementedError("skeleton — PLAN §1.5 sample_codes_batched")
+    B = logits_BV_fp32.shape[0]
+
+    # Per-row greedy mask; argmax over RAW logits exactly like the higgs
+    # per-row reference. Selection is branchless (compute both, torch.where)
+    # because this runs inside the captured CUDA graph in M4.
+    greedy_B = (temperature_B <= _GREEDY_TEMP_THRESHOLD) | (top_k_buf_B == 1)
+    argmax_B = logits_BV_fp32.argmax(dim=-1)
+
+    safe_temp = temperature_B.clamp(min=_GREEDY_TEMP_THRESHOLD).view(B, 1)
+    logits = logits_BV_fp32 / safe_temp
+
+    # Fixed-shape top-k: always topk(full width) + per-row k-th-value gather.
+    # K_MAX (= 2051) in production; clamped to the logits width so tiny-config
+    # tests (PLAN §6.1, vocab < 2051) run the same code path. Still
+    # shape-static under CUDA-graph capture (V is fixed per graph).
+    k_width = min(K_MAX, int(logits_BV_fp32.shape[-1]))
+    top_vals = logits.topk(k_width, dim=-1).values
+    k_idx = top_k_buf_B.view(B, 1).clamp(min=1, max=k_width) - 1
+    kth = top_vals.gather(-1, k_idx)
+    logits = torch.where(logits < kth, float("-inf"), logits)
+
+    if top_p_B is not None:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        cum_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        remove = cum_probs > top_p_B.view(B, 1)
+        # Shift right + force-keep top token so the highest-prob token never
+        # gets cut.
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        scatter = torch.zeros_like(remove)
+        scatter.scatter_(-1, sorted_indices, remove)
+        logits = torch.where(scatter, float("-inf"), logits)
+
+    probs = logits.softmax(dim=-1)
+    sampled_B = probs.multinomial(num_samples=1).squeeze(-1)
+
+    return torch.where(greedy_B, argmax_B, sampled_B).to(torch.long)
 
 
 def frame_finalize_direct(
@@ -103,7 +160,14 @@ def frame_finalize_direct(
         ``(out_codes_B32 int64 [B, 32], new_done_B bool [B],
         was_done_B bool [B])``.
     """
-    raise NotImplementedError("skeleton — PLAN §1.5 frame_finalize_direct")
+    # Clone: callers scatter new_done back into the same CG buffer this view
+    # came from; was_done must survive that write.
+    was_done_B = generation_done_B.clone()
+    eos_now_B = (codes_B32[:, : NUM_CODEBOOKS - 1] == CODEBOOK_EOS).all(dim=-1)
+    new_done_B = was_done_B | eos_now_B
+    stop = torch.full_like(codes_B32, STOP_CODE)
+    out_codes_B32 = torch.where(was_done_B.unsqueeze(-1), stop, codes_B32)
+    return out_codes_B32, new_done_B, was_done_B
 
 
 def step_reference(
@@ -121,4 +185,10 @@ def step_reference(
     Returns:
         ``(out_codes_32 int64 [32], new_done bool, was_done bool)``.
     """
-    raise NotImplementedError("skeleton — PLAN §1.5 step_reference")
+    was_done = bool(generation_done)
+    if was_done:
+        return torch.full_like(codes_32, STOP_CODE), True, True
+    eos_now = bool(
+        (codes_32[: NUM_CODEBOOKS - 1] == CODEBOOK_EOS).all().item()
+    )
+    return codes_32.clone(), eos_now, False

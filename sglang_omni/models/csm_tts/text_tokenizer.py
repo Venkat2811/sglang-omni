@@ -22,6 +22,11 @@ PLAN §1.9.
 
 from __future__ import annotations
 
+import os
+
+from tokenizers import Tokenizer
+from transformers import PreTrainedTokenizerFast
+
 from sglang_omni.models.csm_tts.utils import (
     AUDIO_EOS_TOKEN_ID,
     AUDIO_TOKEN_ID,
@@ -37,7 +42,14 @@ class CsmPromptBuilder:
         """Load the Llama-3 tokenizer from ``<checkpoint_dir>/tokenizer.json``
         via ``tokenizers.Tokenizer`` wrapped in ``PreTrainedTokenizerFast``
         (higgs text_tokenizer pattern)."""
-        raise NotImplementedError("skeleton — PLAN §1.9 CsmPromptBuilder.__init__")
+        # transformers-v5 tokenizer-metadata dodge: bypass from_pretrained and
+        # load the raw tokenizer.json (higgs stages.py:198-200).
+        raw = Tokenizer.from_file(os.path.join(checkpoint_dir, "tokenizer.json"))
+        self._tok = PreTrainedTokenizerFast(tokenizer_object=raw)
+
+    @property
+    def tokenizer(self) -> PreTrainedTokenizerFast:
+        return self._tok
 
     def build_prompt(
         self,
@@ -65,7 +77,38 @@ class CsmPromptBuilder:
             the all-zeros-frame embed at overlay time — HF
             ``_merge_input_ids_with_input_values`` parity, PLAN §2.4).
         """
-        raise NotImplementedError("skeleton — PLAN §1.9 CsmPromptBuilder.build_prompt")
+        context = context or []
+        frame_counts = context_frame_counts or []
+        if len(frame_counts) != len(context):
+            raise ValueError(
+                f"context_frame_counts has {len(frame_counts)} entries for "
+                f"{len(context)} context segments"
+            )
+
+        prompt_ids: list[int] = []
+        placeholder_spans: list[tuple[int, int]] = []
+        for segment, num_frames in zip(context, frame_counts):
+            num_frames = int(num_frames)
+            if num_frames <= 0:
+                # Hub template: every non-final message must carry audio.
+                raise ValueError(
+                    f"context segment needs >= 1 audio frame, got {num_frames}"
+                )
+            prompt_ids.append(BOS)
+            prompt_ids.extend(
+                self.tokenize_segment_text(
+                    segment.get("speaker_id", 0), segment.get("text", "")
+                )
+            )
+            prompt_ids.append(EOT)
+            placeholder_spans.append((len(prompt_ids), num_frames))
+            prompt_ids.extend([AUDIO_TOKEN_ID] * num_frames)
+            prompt_ids.append(AUDIO_EOS_TOKEN_ID)
+
+        prompt_ids.append(BOS)
+        prompt_ids.extend(self.tokenize_segment_text(speaker_id, text))
+        prompt_ids.append(EOT)
+        return prompt_ids, placeholder_spans
 
     def tokenize_segment_text(self, speaker_id: int, text: str) -> list[int]:
         """``tok("[<spk>]<text>", add_special_tokens=False)`` — body tokens
@@ -74,7 +117,7 @@ class CsmPromptBuilder:
         Returns:
             list[int] token ids in the 128256 text vocab.
         """
-        raise NotImplementedError("skeleton — PLAN §1.9 CsmPromptBuilder.tokenize_segment_text")
+        return self._tok.encode(f"[{int(speaker_id)}]{text}", add_special_tokens=False)
 
 
 __all__ = [

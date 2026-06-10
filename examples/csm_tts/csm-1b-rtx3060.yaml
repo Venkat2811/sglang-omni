@@ -17,6 +17,10 @@
 # colocated stages outside SGLang's fence. The binding constraint on the
 # 3060 is COMPUTE (frame step < 80 ms RT), not VRAM.
 #
+# context_length is pinned to 2048 (the CSM hard model ceiling) inside the
+# tts_engine factory (stages.create_sglang_tts_engine_executor) — it is not a
+# YAML knob.
+#
 # Launch:
 #   python -m sglang_omni.cli serve --config examples/csm_tts/csm-1b-rtx3060.yaml
 config_cls: CsmTtsPipelineConfig

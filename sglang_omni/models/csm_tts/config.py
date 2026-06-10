@@ -55,6 +55,12 @@ class CsmTtsPipelineConfig(PipelineConfig):
             gpu=0,
             next="tts_engine",
         ),
+        # Engine-tuning defaults live in the FACTORY, not here (contract §2):
+        # stages.create_sglang_tts_engine_executor pins the 3060 budget from
+        # the PLAN §3.3 VRAM table — context_length=2048, mem_fraction_static
+        # 0.5, cuda_graph_max_bs 8, dtype bfloat16, and disable_cuda_graph=
+        # True (eager is the M2/M3 correctness baseline; False from M4). The
+        # YAML's server_args_overrides deep-merge over those defaults.
         StageConfig(
             name="tts_engine",
             process="pipeline",

@@ -56,12 +56,60 @@ class CsmTtsState:
     def to_dict(self) -> dict[str, Any]:
         """Serialise for ``StagePayload.data`` (sparse: omit None/empty;
         higgs pattern)."""
-        raise NotImplementedError("skeleton — PLAN §1.8 CsmTtsState.to_dict")
+        data: dict[str, Any] = {
+            "speaker_id": self.speaker_id,
+            "prompt_ids": list(self.prompt_ids),
+            "max_new_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+            "top_k": self.top_k,
+            "depth_temperature": self.depth_temperature,
+            "depth_top_k": self.depth_top_k,
+        }
+        if self.text is not None:
+            data["text"] = self.text
+        if self.context:
+            data["context"] = self.context
+        if self.context_codes is not None:
+            data["context_codes"] = self.context_codes
+        if self.num_ctx_codes_consumed:
+            data["num_ctx_codes_consumed"] = self.num_ctx_codes_consumed
+        for key in ("top_p", "seed"):
+            value = getattr(self, key)
+            if value is not None:
+                data[key] = value
+        if self.stream:
+            data["stream"] = True
+        if self.output_frames is not None:
+            data["output_frames"] = self.output_frames
+        for key in ("prompt_tokens", "completion_frames", "engine_time_s"):
+            value = getattr(self, key)
+            if value:
+                data[key] = value
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CsmTtsState":
         """Rebuild from ``StagePayload.data`` produced by :meth:`to_dict`."""
-        raise NotImplementedError("skeleton — PLAN §1.8 CsmTtsState.from_dict")
+        return cls(
+            text=data.get("text"),
+            speaker_id=data.get("speaker_id", 0),
+            context=list(data.get("context", [])),
+            prompt_ids=list(data.get("prompt_ids", [])),
+            context_codes=data.get("context_codes"),
+            num_ctx_codes_consumed=data.get("num_ctx_codes_consumed", 0),
+            max_new_tokens=data.get("max_new_tokens", 125),
+            temperature=data.get("temperature", 0.9),
+            top_k=data.get("top_k", 50),
+            top_p=data.get("top_p"),
+            depth_temperature=data.get("depth_temperature", 0.9),
+            depth_top_k=data.get("depth_top_k", 50),
+            seed=data.get("seed"),
+            stream=data.get("stream", False),
+            output_frames=data.get("output_frames"),
+            prompt_tokens=data.get("prompt_tokens", 0),
+            completion_frames=data.get("completion_frames", 0),
+            engine_time_s=data.get("engine_time_s", 0.0),
+        )
 
 
 __all__ = ["CsmTtsState"]
