@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Pipeline configuration for CSM TTS (V1).
+
+MUST stay sglang/CUDA-free: ``import_pipeline_configs`` pkgutil-scans
+``sglang_omni/models/*`` and SILENTLY skips packages whose import fails — so
+this module never imports ``stages.py`` (the way higgs config.py:9 does); the
+concurrency constant is inlined instead (PLAN §1.15).
+
+PLAN §1.15, §5.
+"""
+
+from __future__ import annotations
+
+from typing import ClassVar
+
+from sglang_omni.config import PipelineConfig, StageConfig
+
+_PKG = "sglang_omni.models.csm_tts"
+
+# Inlined (do NOT import stages.py — registry-silent-skip gotcha). Keep in
+# sync with stages.DEFAULT_MAX_CONCURRENCY.
+_DEFAULT_MAX_CONCURRENCY = 8
+
+
+class CsmTtsPipelineConfig(PipelineConfig):
+    """4-stage CSM TTS pipeline:
+    preprocessing → audio_encoder → tts_engine → vocoder.
+
+    Scheduler-visible AR step = one 80 ms frame (paged backbone forward →
+    cb0 sample → 31-step depth inner AR → 32-code frame → streamed to the
+    vocoder). Every non-terminal stage sets ``next=`` — schema validation
+    requires exactly one of ``next``/``terminal`` per stage
+    (config/schema.py:298-302; review B11).
+    """
+
+    architecture: ClassVar[str] = "CsmForConditionalGeneration"
+
+    model_path: str
+    stages: list[StageConfig] = [
+        StageConfig(
+            name="preprocessing",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_args={"max_concurrency": _DEFAULT_MAX_CONCURRENCY},
+            next="audio_encoder",
+        ),
+        StageConfig(
+            name="audio_encoder",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_audio_encoder_executor",
+            factory_args={
+                "device": "cuda",
+                "max_batch_size": _DEFAULT_MAX_CONCURRENCY,
+            },
+            gpu=0,
+            next="tts_engine",
+        ),
+        StageConfig(
+            name="tts_engine",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
+            factory_args={
+                "device": "cuda",
+                "max_new_tokens": 125,  # frames (DEFAULT_MAX_FRAMES)
+                "enable_async_decode": False,  # True from M4
+                "server_args_overrides": {
+                    "max_running_requests": _DEFAULT_MAX_CONCURRENCY,
+                },
+            },
+            gpu=0,
+            next="vocoder",
+            stream_to=["vocoder"],
+        ),
+        StageConfig(
+            name="vocoder",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_vocoder_executor",
+            factory_args={
+                "device": "cuda",
+                "dtype": "float32",  # conv-transpose decode stability
+                "max_batch_size": _DEFAULT_MAX_CONCURRENCY,
+            },
+            gpu=0,
+            terminal=True,
+            can_accept_stream_before_payload=True,
+        ),
+    ]
+
+
+EntryClass = CsmTtsPipelineConfig
