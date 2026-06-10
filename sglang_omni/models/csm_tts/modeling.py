@@ -364,7 +364,7 @@ class CsmDepthDecoder(nn.Module):
 
         # Additive causal mask over the full static window; row p hides every
         # key slot > p, which is also what makes per-frame KV reset a no-op.
-        causal = torch.zeros(ctx, ctx)
+        causal = torch.zeros(ctx, ctx, dtype=torch.float32)
         causal.masked_fill_(
             torch.ones(ctx, ctx, dtype=torch.bool).triu(1),
             torch.finfo(torch.float32).min,
