@@ -190,7 +190,41 @@ def allocate_endpoints(
     }
     for stage in stages:
         endpoints[f"stage_{stage.name}"] = f"ipc://{base_dir}/stage_{stage.name}.sock"
+    _validate_myelon_segment_budget(endpoints)
     return endpoints
+
+
+def _validate_myelon_segment_budget(endpoints: dict[str, str]) -> None:
+    """When OMNI_CONTROL_TRANSPORT=myelon, mint + validate every ring's SHM
+    segment name under the portable (<=14-char) PSHMNAMLEN budget, fail-loud.
+
+    This centralises the name check in the single endpoint-mint site so the
+    swap can't silently produce an over-budget segment name at spawn time.
+    The per-edge ring names themselves are minted in
+    ``myelon_control.mint_segment_name`` (called in each stage process); here
+    we validate the worst-case (length is deterministic from the scheme).
+    """
+    import os
+
+    if os.environ.get("OMNI_CONTROL_TRANSPORT", "zmq").strip().lower() != "myelon":
+        return
+    try:
+        from sglang_omni.pipeline.myelon_control import mint_segment_name
+    except Exception as exc:  # extension missing -> fail loud, no silent ZMQ fallback
+        raise RuntimeError(
+            "OMNI_CONTROL_TRANSPORT=myelon but myelon_control/myelon_zmq_py "
+            f"is unavailable: {exc}"
+        ) from exc
+    # Validate one name per role for every consumer endpoint; mint_segment_name
+    # raises if any exceeds the SHM budget.
+    for key, endpoint in endpoints.items():
+        role = "s" if key == "completion" else ("a" if key == "abort" else "r")
+        mint_segment_name(endpoint, role, "validate-0")
+    logger.info(
+        "OMNI_CONTROL_TRANSPORT=myelon: %d control-plane edges pass the "
+        "SHM segment-name budget",
+        len(endpoints),
+    )
 
 
 def _truncate_ipc_namespace_prefix(

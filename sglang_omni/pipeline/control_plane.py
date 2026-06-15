@@ -49,6 +49,13 @@ def deserialize_message(data: bytes) -> ControlMessage:
     return parse_message(d)
 
 
+# The myelon carrier backend. Imported here (after the codec functions it
+# depends on are defined) so the OMNI_CONTROL_TRANSPORT=myelon path can reuse
+# serialize/deserialize_message verbatim. The flag is read inside each socket
+# class __init__, so the default ZMQ path never constructs a myelon ring.
+import sglang_omni.pipeline.myelon_control as _myelon_control  # noqa: E402
+
+
 class ControlPlaneContext:
     """Shared ZMQ context for control plane."""
 
@@ -70,15 +77,30 @@ class ControlPlaneContext:
             cls._context = None
 
 
+def _ring_role(endpoint: str) -> str:
+    """Map an endpoint to its myelon ring role: 's' (responses) for the
+    coordinator completion edge, 'r' (requests) for every stage work edge."""
+    return "s" if endpoint.rstrip("/").endswith("completion.sock") else "r"
+
+
 class PushSocket:
     """Async PUSH socket for sending messages to a single destination."""
 
     def __init__(self, endpoint: str):
         self.endpoint = endpoint
         self._socket: zmq.asyncio.Socket | None = None
+        self._myelon: "_myelon_control.MyelonPushSocket | None" = None
+        if _myelon_control.use_myelon():
+            self._myelon = _myelon_control.MyelonPushSocket(
+                endpoint, role=_ring_role(endpoint)
+            )
 
     async def connect(self) -> None:
         """Connect to the endpoint."""
+        if self._myelon is not None:
+            await self._myelon.connect()
+            logger.debug("PUSH (myelon) ring opened to %s", self.endpoint)
+            return
         ctx = ControlPlaneContext.get()
         self._socket = ctx.socket(zmq.PUSH)
         self._socket.connect(self.endpoint)
@@ -86,6 +108,10 @@ class PushSocket:
 
     async def send(self, msg: ControlMessage) -> None:
         """Send a message."""
+        if self._myelon is not None:
+            await self._myelon.send(msg)
+            logger.debug("PUSH (myelon) sent %s to %s", type(msg).__name__, self.endpoint)
+            return
         if self._socket is None:
             raise RuntimeError("Socket not connected")
         data = serialize_message(msg)
@@ -94,6 +120,9 @@ class PushSocket:
 
     def close(self) -> None:
         """Close the socket."""
+        if self._myelon is not None:
+            self._myelon.close()
+            self._myelon = None
         if self._socket is not None:
             self._socket.close()
             self._socket = None
@@ -106,9 +135,18 @@ class PullSocket:
         self.endpoint = endpoint
         self.bind = bind
         self._socket: zmq.asyncio.Socket | None = None
+        self._myelon: "_myelon_control.MyelonPullSocket | None" = None
+        if _myelon_control.use_myelon():
+            self._myelon = _myelon_control.MyelonPullSocket(
+                endpoint, role=_ring_role(endpoint)
+            )
 
     async def start(self) -> None:
         """Bind or connect the socket."""
+        if self._myelon is not None:
+            await self._myelon.start()
+            logger.debug("PULL (myelon) drain started for %s", self.endpoint)
+            return
         ctx = ControlPlaneContext.get()
         self._socket = ctx.socket(zmq.PULL)
         if self.bind:
@@ -120,6 +158,10 @@ class PullSocket:
 
     async def recv(self) -> ControlMessage:
         """Receive a message (blocking)."""
+        if self._myelon is not None:
+            msg = await self._myelon.recv()
+            logger.debug("PULL (myelon) received %s", type(msg).__name__)
+            return msg
         if self._socket is None:
             raise RuntimeError("Socket not started")
         data = await self._socket.recv()
@@ -129,6 +171,8 @@ class PullSocket:
 
     async def recv_nowait(self) -> ControlMessage | None:
         """Try to receive a message (non-blocking)."""
+        if self._myelon is not None:
+            return await self._myelon.recv_nowait()
         if self._socket is None:
             raise RuntimeError("Socket not started")
         try:
@@ -139,6 +183,9 @@ class PullSocket:
 
     def close(self) -> None:
         """Close the socket."""
+        if self._myelon is not None:
+            self._myelon.close()
+            self._myelon = None
         if self._socket is not None:
             self._socket.close()
             self._socket = None
@@ -150,9 +197,16 @@ class PubSocket:
     def __init__(self, endpoint: str):
         self.endpoint = endpoint
         self._socket: zmq.asyncio.Socket | None = None
+        self._myelon: "_myelon_control.MyelonPubSocket | None" = None
+        if _myelon_control.use_myelon():
+            self._myelon = _myelon_control.MyelonPubSocket(endpoint)
 
     async def bind(self) -> None:
         """Bind the socket."""
+        if self._myelon is not None:
+            await self._myelon.bind()
+            logger.debug("PUB (myelon) bound to %s", self.endpoint)
+            return
         ctx = ControlPlaneContext.get()
         self._socket = ctx.socket(zmq.PUB)
         self._socket.bind(self.endpoint)
@@ -162,6 +216,10 @@ class PubSocket:
 
     async def publish(self, msg: AbortMessage) -> None:
         """Publish a message to all subscribers."""
+        if self._myelon is not None:
+            await self._myelon.publish(msg)
+            logger.debug("PUB (myelon) published %s", type(msg).__name__)
+            return
         if self._socket is None:
             raise RuntimeError("Socket not bound")
         data = serialize_message(msg)
@@ -170,6 +228,9 @@ class PubSocket:
 
     def close(self) -> None:
         """Close the socket."""
+        if self._myelon is not None:
+            self._myelon.close()
+            self._myelon = None
         if self._socket is not None:
             self._socket.close()
             self._socket = None
@@ -181,9 +242,16 @@ class SubSocket:
     def __init__(self, endpoint: str):
         self.endpoint = endpoint
         self._socket: zmq.asyncio.Socket | None = None
+        self._myelon: "_myelon_control.MyelonSubSocket | None" = None
+        if _myelon_control.use_myelon():
+            self._myelon = _myelon_control.MyelonSubSocket(endpoint)
 
     async def connect(self) -> None:
         """Connect to the publisher."""
+        if self._myelon is not None:
+            await self._myelon.connect()
+            logger.debug("SUB (myelon) connected to %s", self.endpoint)
+            return
         ctx = ControlPlaneContext.get()
         self._socket = ctx.socket(zmq.SUB)
         self._socket.connect(self.endpoint)
@@ -192,6 +260,12 @@ class SubSocket:
 
     async def recv(self) -> AbortMessage:
         """Receive a broadcast message (blocking)."""
+        if self._myelon is not None:
+            msg = await self._myelon.recv()
+            if not isinstance(msg, AbortMessage):
+                raise ValueError(f"Expected AbortMessage, got {type(msg)}")
+            logger.debug("SUB (myelon) received %s", type(msg).__name__)
+            return msg
         if self._socket is None:
             raise RuntimeError("Socket not connected")
         data = await self._socket.recv()
@@ -203,12 +277,17 @@ class SubSocket:
 
     def poll(self, timeout_ms: int = 0) -> bool:
         """Check if a message is available."""
+        if self._myelon is not None:
+            return self._myelon.poll(timeout_ms)
         if self._socket is None:
             raise RuntimeError("Socket not connected")
         return self._socket.poll(timeout_ms, zmq.POLLIN) != 0
 
     def close(self) -> None:
         """Close the socket."""
+        if self._myelon is not None:
+            self._myelon.close()
+            self._myelon = None
         if self._socket is not None:
             self._socket.close()
             self._socket = None
