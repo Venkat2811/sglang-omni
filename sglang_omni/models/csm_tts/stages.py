@@ -24,6 +24,7 @@ from typing import Any
 import torch
 import torchaudio.functional as F_audio
 
+from sglang_omni.models.csm_tts.codec_lane_pool import CodecLanePool
 from sglang_omni.models.csm_tts.model_runner import CsmTTSModelRunner
 from sglang_omni.models.csm_tts.payload_types import CsmTtsState
 from sglang_omni.models.csm_tts.request_builders import make_csm_scheduler_adapters
@@ -40,6 +41,10 @@ from sglang_omni.models.csm_tts.utils import (
     to_codes_F32,
 )
 from sglang_omni.models.csm_tts.vocoder_scheduler import CsmStreamingVocoderScheduler
+from sglang_omni.models.csm_tts.warmup import (
+    prewarm_codec_decode,
+    prewarm_engine_frame_path,
+)
 from sglang_omni.preprocessing.cache_key import hash_bytes, hash_media_item
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
@@ -570,6 +575,16 @@ def create_sglang_tts_engine_executor(
         async_decode_min_batch_size=async_decode_min_batch_size,
     )
     model_runner.set_stream_outbox(scheduler.outbox)
+
+    # Boot pre-warm (R0 §6): capture/autotune the decode-step path NOW, before
+    # this scheduler starts serving, so the first request is a graph replay
+    # (when graphs are enabled) rather than a cold prefill. No-op-safe on a
+    # backend without a warmup hook; graph capture only fires when graphs are
+    # enabled in the resolved server args.
+    prewarm_engine_frame_path(
+        model_worker,
+        cuda_graph_enabled=not bool(getattr(server_args, "disable_cuda_graph", True)),
+    )
     return scheduler
 
 
@@ -584,6 +599,7 @@ def create_vocoder_executor(
     stream_followup_stride: int = 6,
     stream_overlap_frames: int = 4,
     stream_holdback_frames: int = 2,
+    codec_lanes: int | None = None,
 ) -> CsmStreamingVocoderScheduler:
     """Mimi DECODE stage (fp32 default — conv-transpose stability).
 
@@ -591,11 +607,28 @@ def create_vocoder_executor(
     → :class:`CsmStreamingVocoderScheduler` with the 12.5 Hz framing knobs
     (PLAN §4.1).
 
+    Wires two O2 capabilities (R0 §6/§8/§9):
+
+    - **Boot pre-warm** of the Mimi decode kernels at every batch-size bucket
+      BEFORE this scheduler serves, so first-audio latency does not pay the
+      codec cold-start tax (the dominant TTFA cost for the first chunk).
+    - A **codec-lane pool** sized to ``codec_lanes`` (defaults to
+      ``max_batch_size``) handed to the scheduler as a first-class admission
+      resource, so the codec stage's concurrency ceiling is budgeted and
+      surfaced in telemetry instead of manifesting as underrun.
+
     Returns:
         ``CsmStreamingVocoderScheduler``.
     """
     checkpoint_dir = resolve_checkpoint(model_path)
     codec = get_or_load_codec(checkpoint_dir, device, dtype)
+
+    # Pre-warm decode kernels for every bucket the vocoder will actually use,
+    # before the stage advertises readiness (R0 §6).
+    prewarm_codec_decode(codec, max_batch_size=max_batch_size)
+
+    lane_count = int(codec_lanes) if codec_lanes is not None else int(max_batch_size)
+    codec_lane_pool = CodecLanePool(lane_count)
 
     return CsmStreamingVocoderScheduler(
         codec,
@@ -605,6 +638,7 @@ def create_vocoder_executor(
         stream_holdback_frames=stream_holdback_frames,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        codec_lane_pool=codec_lane_pool,
     )
 
 

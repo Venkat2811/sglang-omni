@@ -48,6 +48,8 @@ from sglang_omni.models.csm_tts.audio_codec import (
     sanitize_for_mimi,
     trim_at_first_all_zero_frame,
 )
+from sglang_omni.models.csm_tts.codec_lane_pool import CodecLanePool
+from sglang_omni.models.csm_tts.frame_metrics import FrameLatencyTracker
 from sglang_omni.models.csm_tts.payload_types import CsmTtsState
 from sglang_omni.models.tts_streaming import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
@@ -81,6 +83,9 @@ class CsmStreamState:
     clamp_count: int = 0  # sanitize_for_mimi telemetry (gate only at temp=0)
     past_key_values: Any | None = None  # M4+ stateful path ONLY
     done: bool = False
+    # O2: per-request realtime SLO signal + codec-lane bookkeeping.
+    ifl: FrameLatencyTracker = field(default_factory=FrameLatencyTracker)
+    codec_lane_held: bool = False
 
 
 class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
@@ -97,11 +102,19 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         stream_holdback_frames: int = 2,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
+        codec_lane_pool: CodecLanePool | None = None,
     ) -> None:
         """Validate knobs, hold the shared :class:`CsmMimiCodec`, init the
         per-request ``_stream_states`` dict, then ``super().__init__(
         self._vocode_payload, batch_compute_fn=self._vocode_payloads,
-        max_batch_size=..., max_batch_wait_ms=...)`` (higgs ctor shape)."""
+        max_batch_size=..., max_batch_wait_ms=...)`` (higgs ctor shape).
+
+        ``codec_lane_pool`` (O2, R0 §9): the first-class codec-stage admission
+        resource. When provided, each streaming request acquires one lane for
+        the life of the stream and releases it on done/abort; saturation shows
+        up in :meth:`metrics_snapshot`. Defaults to a pool sized to
+        ``max_batch_size`` so the codec ceiling is always budgeted even when a
+        caller forgets to pass one in."""
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream_stride and stream_followup_stride must be > 0")
         if stream_overlap_frames < 0:
@@ -118,6 +131,7 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._samples_per_frame = CsmMimiCodec.SAMPLES_PER_FRAME
         self._stream_states: dict[str, CsmStreamState] = {}
         self._clamp_count_total = 0  # process-wide fence-#2 counter
+        self._codec_lane_pool = codec_lane_pool or CodecLanePool(max(max_batch_size, 1))
 
         super().__init__(
             self._vocode_payload,
@@ -143,6 +157,16 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         payload/params (higgs latch discipline; the stage runs with
         ``can_accept_stream_before_payload=True``)."""
         state = self._stream_states.setdefault(request_id, CsmStreamState())
+        # O2: take a codec lane for the life of this stream (R0 §9). The engine
+        # admission gate already bounds concurrency, so under normal operation
+        # a lane is always available here; the pool is the defence-in-depth
+        # ceiling + the saturation telemetry source. try_acquire never blocks
+        # the stage thread — a saturated pool is recorded, not queued.
+        if not state.codec_lane_held:
+            state.codec_lane_held = self._codec_lane_pool.try_acquire()
+        # Fresh IFL window per stream so the first frame is never counted as a
+        # gap against the realtime clock.
+        state.ifl.reset()
         data = payload.data if isinstance(payload.data, dict) else {}
         self._latch_stream_contract(
             request_id,
@@ -237,8 +261,28 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
     def clear_stream_state(self, request_id: str) -> None:
         """Drop the per-request :class:`CsmStreamState` INCLUDING any Mimi
         ``past_key_values`` — the cross-request state-leak guard (abort path
-        calls this too)."""
-        self._stream_states.pop(request_id, None)
+        calls this too). Releases the request's codec lane back to the pool so
+        an aborted/finished stream never leaks a lane (O2, R0 §9)."""
+        state = self._stream_states.pop(request_id, None)
+        if state is not None and state.codec_lane_held:
+            self._codec_lane_pool.release()
+            state.codec_lane_held = False
+
+    def metrics_snapshot(self, request_id: str | None = None) -> dict[str, Any]:
+        """Operational telemetry for the codec/vocoder stage (O2, R0 §8/§9).
+
+        Always carries the codec-lane pool occupancy/saturation counters. When
+        ``request_id`` names a live stream, also folds in that stream's IFL
+        p50/p95/p99 + ``underrun_frac`` against the 80 ms frame clock — the
+        realtime SLO signal. Shapes match the existing per-stream telemetry so
+        this drops into the ``/v1/streams/{id}/metrics`` surface unchanged."""
+        snapshot: dict[str, Any] = dict(self._codec_lane_pool.stats().to_dict())
+        if request_id is not None:
+            state = self._stream_states.get(request_id)
+            if state is not None:
+                snapshot.update(state.ifl.snapshot().to_dict())
+                snapshot["frames_emitted"] = state.frames_emitted
+        return snapshot
 
     # --- latch helpers ----------------------------------------------------------
 
@@ -407,8 +451,14 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         if delta.numel() == 0:
             return []
 
+        # O2 IFL (R0 §8): record the inter-frame latency for the frames in this
+        # emitted chunk. The gap is amortized across frames so strided emission
+        # is comparable to single-frame emission for the underrun test.
+        emitted_frames = emit_until - state.frames_emitted
         state.frames_emitted = emit_until
         state.samples_emitted += int(delta.numel())
+        if emitted_frames > 0:
+            state.ifl.record_frame(frames=emitted_frames)
         return [
             OutgoingMessage(
                 request_id=request_id,
