@@ -14,6 +14,7 @@ PLAN §1.14.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import threading
 from collections import OrderedDict
@@ -426,6 +427,25 @@ def create_audio_encoder_executor(
     )
 
 
+def _merge_model_override(
+    overrides: dict[str, Any], extra: dict[str, Any]
+) -> None:
+    """Merge ``extra`` model-config fields into the SGLang-native
+    ``json_model_override_args`` string already present in ``overrides`` (if
+    any). SGLang applies that JSON onto the HF config before the model is
+    built, so this is how an OSS-native config field reaches
+    :class:`CsmTTSModel` without a private env flag. User-supplied keys win."""
+    raw = overrides.get("json_model_override_args")
+    merged: dict[str, Any] = {}
+    if isinstance(raw, str) and raw.strip():
+        merged.update(json.loads(raw))
+    elif isinstance(raw, dict):
+        merged.update(raw)
+    for key, value in extra.items():
+        merged.setdefault(key, value)
+    overrides["json_model_override_args"] = json.dumps(merged)
+
+
 def create_sglang_tts_engine_executor(
     model_path: str,
     *,
@@ -434,6 +454,7 @@ def create_sglang_tts_engine_executor(
     server_args_overrides: dict[str, Any] | None = None,
     enable_async_decode: bool = False,
     async_decode_min_batch_size: int = 2,
+    depth_batching: bool = True,
 ) -> OmniScheduler:
     """SGLang-backed frame-AR engine (the §3-contract recipe).
 
@@ -476,6 +497,13 @@ def create_sglang_tts_engine_executor(
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+
+    # Depth-loop execution path (R0 §1): forward the OSS-native ``depth_batching``
+    # field onto the model config via SGLang's standard
+    # ``json_model_override_args``. ``CsmTTSModel`` reads it (default True =
+    # B=N fused depth loop; False = per-lane B=1 safe fallback). A direct
+    # ``json_model_override_args`` in server_args_overrides still wins.
+    _merge_model_override(overrides, {"depth_batching": bool(depth_batching)})
 
     server_args = build_sglang_server_args(
         checkpoint_dir,

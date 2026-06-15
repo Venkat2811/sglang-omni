@@ -45,6 +45,26 @@ from sglang_omni.models.csm_tts.weight_loader import CsmWeightMapper
 
 _DEFAULT_MAX_BATCH_SIZE = 64
 
+# OSS-native config field selecting the depth-loop execution path (R0 §1).
+# ``True`` (default) fuses the RVQ/depth inner AR loop at B=N across concurrent
+# decode lanes; ``False`` runs the safe per-lane fallback (each lane's loop at
+# B=1). Driven through SGLang's standard config-override surface
+# (``--json-model-override-args '{"depth_batching": false}'`` / ``hf_overrides``),
+# which lands the field on the model's ``CsmTtsHfConfig`` — no env flag needed.
+_DEPTH_BATCHING_CONFIG_FIELD = "depth_batching"
+_DEFAULT_DEPTH_BATCHING = True
+
+
+def _resolve_depth_batching(config: Any) -> bool:
+    """Read the ``depth_batching`` config field (default ``True``).
+
+    Accepts native bool or the string forms a JSON/CLI override may deliver
+    (``"false"`` / ``"0"`` / ``"no"`` → ``False``)."""
+    value = getattr(config, _DEPTH_BATCHING_CONFIG_FIELD, _DEFAULT_DEPTH_BATCHING)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off"}
+    return bool(value)
+
 
 @dataclass
 class CsmGenParams:
@@ -139,10 +159,16 @@ class CsmTTSModel(nn.Module):
 
         self._max_batch_size = int(max_batch_size)
         pool_size = self._max_batch_size + 1
+        # Depth-loop execution path (R0 §1): batched B=N across lanes (default)
+        # or the per-lane B=1 safe fallback, selected by the model-config field.
+        self._depth_batching = _resolve_depth_batching(config)
         # frame_embedding is SHARED with the depth decoder (tied table);
         # depth KV is slot-indexed so max_slots = pool_size covers any batch.
         self.depth_decoder = CsmDepthDecoder(
-            depth_cfg, self.frame_embedding, max_slots=pool_size
+            depth_cfg,
+            self.frame_embedding,
+            max_slots=pool_size,
+            depth_batching=self._depth_batching,
         )
         # Loader-visible alias: the §1.6 remap routes the checkpoint's
         # ``depth_decoder.codebooks_head.weight`` to ``codebooks_head.weight``;

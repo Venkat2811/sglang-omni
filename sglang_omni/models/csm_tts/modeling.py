@@ -333,13 +333,31 @@ class CsmDepthDecoder(nn.Module):
         depth_cfg: Any,
         frame_embedding: CsmFrameEmbedding,
         max_slots: int,
+        depth_batching: bool = True,
     ) -> None:
         """``frame_embedding`` is SHARED with the outer model (tied table);
-        ``max_slots`` sizes the static KV (= CG max batch size)."""
+        ``max_slots`` sizes the static KV (= CG max batch size).
+
+        ``depth_batching`` selects how the inner RVQ/depth AR loop runs over a
+        multi-lane decode batch (PLAN §1.4; R0 §1 "depth-loop batching"):
+
+        - ``True`` (default, optimized): run every depth step at ``B = bs`` —
+          one GEMM/step fused across all concurrent lanes. The small
+          depth-decoder dominates per-frame time (31 tiny AR steps/frame), so
+          fusing the per-step host-launch + weight-load cost across lanes
+          amortizes it. This is the throughput path.
+        - ``False`` (safe per-lane fallback): run each lane's 31-step loop
+          independently at ``B = 1`` through the SAME primitives, looping over
+          lanes on the host. Slower, but immune to any cross-lane batched-GEMM
+          numerics question — the correctness reference the optimized path is
+          A/B'd against. A single binary can toggle the two via one config
+          field, leaving everything else identical.
+        """
         super().__init__()
         self.config = depth_cfg
         self.max_slots = max_slots
         self.num_codebooks = depth_cfg.num_codebooks
+        self.depth_batching = bool(depth_batching)
         self.frame_embedding = frame_embedding
         self.inputs_embeds_projector = nn.Linear(
             depth_cfg.backbone_hidden_size, depth_cfg.hidden_size, bias=False
@@ -401,6 +419,65 @@ class CsmDepthDecoder(nn.Module):
             )
         return self.norm(hidden[:, -1])
 
+    def _generate_frame_over_slots(
+        self,
+        h_B2048: torch.Tensor,
+        cb0_B: torch.Tensor,
+        temps_B: torch.Tensor,
+        top_ks_B: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """The 31-step depth AR over whatever lanes ``h_B2048`` carries.
+
+        This is the single shared inner loop: ``B`` is just ``h_B2048``'s lead
+        dim, so the SAME code runs the fused ``B = bs`` path (one call) and the
+        ``B = 1`` per-lane fallback (one call per lane). No data-dependent host
+        control flow — CG-capturable as one graph in M4.
+
+        Step 0+1: forward ``[proj(h), proj(embed_codebook(cb0, 0))]`` (len-2
+        "depth prefill") → head ``W[0]`` → sample cb1. Then 30 more len-1
+        steps: position ``p`` embeds the previous code with table offset
+        ``(p - 1) * 2051``, head ``W[p - 1]`` samples ``cb_p`` — total 31
+        sampled codes; cb31 is never forwarded (HF parity). Logits cast fp32
+        before sampling; per-row branchless greedy/top-k via
+        :func:`sampler.sample_codes_batched`.
+
+        Args:
+            h_B2048: ``[B, 2048]`` bf16 post-norm backbone hidden.
+            cb0_B: int64 ``[B]`` sampled codebook-0 codes.
+            temps_B: fp32 ``[B]`` depth temperatures (already sliced to ``B``).
+            top_ks_B: int64 ``[B]`` depth top-k buffer (already sliced to ``B``).
+            k_cache / v_cache: static-KV views ``[4, B, 2, 33, 128]``.
+
+        Returns:
+            int64 ``[B, 32]`` — full frame ``[cb0 | cb1..cb31]``.
+        """
+        # Depth prefill, positions 0+1: position 0 is the RAW 2048-dim backbone
+        # hidden (replaces the placeholder embedding, modeling_csm.py:480-481);
+        # position 1 is cb0 embedded with codebook table 0. Both then pass the
+        # 2048→1024 projector (modeling_csm.py:488).
+        embeds = torch.stack(
+            [h_B2048, self.frame_embedding.embed_codebook(cb0_B, 0)], dim=1
+        )
+        h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=0)
+        prev = sampler.sample_codes_batched(
+            self.codebooks_head(h_last, 0).float(), temps_B, top_ks_B
+        )
+        codes = [cb0_B, prev]
+
+        # Positions 2..31: position p holds cb_{p-1} (table offset (p-1)*2051),
+        # head W[p-1] samples cb_p. cb31 (sampled at p=31) is never forwarded.
+        for p in range(2, self.num_codebooks):
+            embeds = self.frame_embedding.embed_codebook(prev, p - 1).unsqueeze(1)
+            h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=p)
+            prev = sampler.sample_codes_batched(
+                self.codebooks_head(h_last, p - 1).float(), temps_B, top_ks_B
+            )
+            codes.append(prev)
+
+        return torch.stack(codes, dim=1)
+
     def generate_frame(
         self,
         h_B2048: torch.Tensor,
@@ -410,16 +487,18 @@ class CsmDepthDecoder(nn.Module):
         *,
         bs: int,
     ) -> torch.Tensor:
-        """Run the 31-step depth AR for one frame, batched across ``[:bs]``.
+        """Run the 31-step depth AR for one frame across ``[:bs]`` lanes.
 
-        Step 0+1: forward ``[proj(h), proj(embed_codebook(cb0, 0))]`` (len-2
-        "depth prefill") → head ``W[0]`` → sample cb1. Then 30 more len-1
-        steps: position ``p`` embeds the previous code with table offset
-        ``(p - 1) * 2051``, head ``W[p - 1]`` samples ``cb_p`` — total 31
-        sampled codes; cb31 is never forwarded (HF parity). Fixed
-        31-iteration host loop, no data-dependent branches (CG-capturable as
-        one graph in M4). Logits cast fp32 before sampling; per-row branchless
-        greedy/top-k via :func:`sampler.sample_codes_batched`.
+        Dispatches on :attr:`depth_batching` (R0 §1 "depth-loop batching" with
+        a per-lane safe fallback; the flag is wired from model config so one
+        binary A/Bs the two without any other change):
+
+        - batched (default): one fused call at ``B = bs`` — the depth GEMM/step
+          is shared across all concurrent lanes, amortizing the per-step
+          host-launch + weight-load cost (the throughput path).
+        - per-lane fallback: loop over lanes, each running the SAME inner loop
+          at ``B = 1`` through its own KV slot, then stack. Slower but immune to
+          any cross-lane batched-GEMM numerics question — the reference path.
 
         Args:
             h_B2048: ``[B, 2048]`` bf16 post-norm backbone hidden.
@@ -433,35 +512,34 @@ class CsmDepthDecoder(nn.Module):
         """
         assert bs <= self.max_slots, f"bs={bs} exceeds depth KV slots {self.max_slots}"
         assert h_B2048.shape[0] == bs and cb0_B.shape[0] == bs
-        temps = temps_B[:bs]
-        top_ks = top_ks_B[:bs]
-        k_cache = self.k_cache[:, :bs]
-        v_cache = self.v_cache[:, :bs]
 
-        # Depth prefill, positions 0+1: position 0 is the RAW 2048-dim backbone
-        # hidden (replaces the placeholder embedding, modeling_csm.py:480-481);
-        # position 1 is cb0 embedded with codebook table 0. Both then pass the
-        # 2048→1024 projector (modeling_csm.py:488).
-        embeds = torch.stack(
-            [h_B2048, self.frame_embedding.embed_codebook(cb0_B, 0)], dim=1
-        )
-        h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=0)
-        prev = sampler.sample_codes_batched(
-            self.codebooks_head(h_last, 0).float(), temps, top_ks
-        )
-        codes = [cb0_B, prev]
-
-        # Positions 2..31: position p holds cb_{p-1} (table offset (p-1)*2051),
-        # head W[p-1] samples cb_p. cb31 (sampled at p=31) is never forwarded.
-        for p in range(2, self.num_codebooks):
-            embeds = self.frame_embedding.embed_codebook(prev, p - 1).unsqueeze(1)
-            h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=p)
-            prev = sampler.sample_codes_batched(
-                self.codebooks_head(h_last, p - 1).float(), temps, top_ks
+        if self.depth_batching:
+            return self._generate_frame_over_slots(
+                h_B2048,
+                cb0_B,
+                temps_B[:bs],
+                top_ks_B[:bs],
+                self.k_cache[:, :bs],
+                self.v_cache[:, :bs],
             )
-            codes.append(prev)
 
-        return torch.stack(codes, dim=1)
+        # Per-lane safe fallback: each lane runs the inner loop at B=1 through
+        # its own KV slot. Same primitives, same math — only the batch axis of
+        # the depth GEMMs differs, so this is the correctness reference the
+        # batched path is A/B'd against.
+        per_lane: list[torch.Tensor] = []
+        for lane in range(bs):
+            sl = slice(lane, lane + 1)
+            codes_132 = self._generate_frame_over_slots(
+                h_B2048[sl],
+                cb0_B[sl],
+                temps_B[sl],
+                top_ks_B[sl],
+                self.k_cache[:, sl],
+                self.v_cache[:, sl],
+            )
+            per_lane.append(codes_132)
+        return torch.cat(per_lane, dim=0)
 
 
 __all__ = [
