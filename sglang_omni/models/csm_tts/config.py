@@ -14,6 +14,12 @@ from __future__ import annotations
 from typing import ClassVar
 
 from sglang_omni.config import PipelineConfig, StageConfig
+from sglang_omni.config.schema import StageRuntimeConfig, StageResourceConfig
+
+_ENC_RT = StageRuntimeConfig(resources=StageResourceConfig(total_gpu_memory_fraction=0.03))
+_ENG_RT = StageRuntimeConfig(resources=StageResourceConfig(total_gpu_memory_fraction=0.60))
+_VOC_RT = StageRuntimeConfig(resources=StageResourceConfig(total_gpu_memory_fraction=0.32))
+
 
 _PKG = "sglang_omni.models.csm_tts"
 
@@ -47,6 +53,7 @@ class CsmTtsPipelineConfig(PipelineConfig):
         StageConfig(
             name="audio_encoder",
             process="pipeline",
+            runtime=_ENC_RT,
             factory=f"{_PKG}.stages.create_audio_encoder_executor",
             factory_args={
                 "device": "cuda",
@@ -64,6 +71,7 @@ class CsmTtsPipelineConfig(PipelineConfig):
         StageConfig(
             name="tts_engine",
             process="pipeline",
+            runtime=_ENG_RT,
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory_args={
                 "device": "cuda",
@@ -79,7 +87,8 @@ class CsmTtsPipelineConfig(PipelineConfig):
         ),
         StageConfig(
             name="vocoder",
-            process="pipeline",
+            process="vocoder",
+            runtime=_VOC_RT,
             factory=f"{_PKG}.stages.create_vocoder_executor",
             factory_args={
                 "device": "cuda",

@@ -40,13 +40,26 @@ ControlMessage = (
 
 def serialize_message(msg: ControlMessage) -> bytes:
     """Serialize a message to bytes."""
-    return msgpack.packb(msg.to_dict(), use_bin_type=True)
+    import time as _t
+    _d = msg.to_dict()
+    _t0 = _t.perf_counter_ns()
+    _data = msgpack.packb(_d, use_bin_type=True)
+    _us = (_t.perf_counter_ns() - _t0) / 1000.0
+    from sglang_omni.pipeline import wire_trace as _wt
+    _wt.record_control(_d, len(_data), "tx", _us)
+    return _data
 
 
 def deserialize_message(data: bytes) -> ControlMessage:
     """Deserialize bytes to a message."""
+    import time as _t
+    _t0 = _t.perf_counter_ns()
     d = msgpack.unpackb(data, raw=False)
-    return parse_message(d)
+    _msg = parse_message(d)
+    _us = (_t.perf_counter_ns() - _t0) / 1000.0
+    from sglang_omni.pipeline import wire_trace as _wt
+    _wt.record_control(d, len(data), "rx", _us)
+    return _msg
 
 
 # The myelon carrier backend. Imported here (after the codec functions it
@@ -115,7 +128,11 @@ class PushSocket:
         if self._socket is None:
             raise RuntimeError("Socket not connected")
         data = serialize_message(msg)
+        import time as _t
+        _t0 = _t.perf_counter_ns()
         await self._socket.send(data)
+        from sglang_omni.pipeline import wire_trace as _wt
+        _wt.record_send(type(msg).__name__, len(data), (_t.perf_counter_ns() - _t0) / 1000.0)
         logger.debug("PUSH sent %s to %s", type(msg).__name__, self.endpoint)
 
     def close(self) -> None:
