@@ -267,6 +267,31 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         if state is not None and state.codec_lane_held:
             self._codec_lane_pool.release()
             state.codec_lane_held = False
+        # O2 telemetry (R0 §8/§9): emit the honest SERVER-SIDE per-stream IFL +
+        # codec-lane occupancy at stream teardown so a bench harness can read
+        # the realtime SLO signal (measured at frame emit, before HTTP buffering)
+        # and confirm lanes return to the pool (in_use -> 0) from the log alone.
+        # No behavior change; pure structured logging on the existing teardown.
+        if state is not None:
+            ifl = state.ifl.snapshot()
+            pool = self._codec_lane_pool.stats()
+            logger.info(
+                "CSM_STREAM_DONE rid=%s frames=%d ifl_p50=%.2f ifl_p95=%.2f "
+                "ifl_p99=%.2f ifl_max=%.2f underrun_frac=%.4f ifl_samples=%d "
+                "lanes_in_use=%d lanes_peak=%d lanes_cap=%d lanes_rejected=%d",
+                request_id,
+                state.frames_emitted,
+                ifl.p50_ms,
+                ifl.p95_ms,
+                ifl.p99_ms,
+                ifl.max_ms,
+                ifl.underrun_frac,
+                ifl.samples,
+                pool.in_use,
+                pool.peak_in_use,
+                pool.capacity,
+                pool.total_rejected,
+            )
 
     def metrics_snapshot(self, request_id: str | None = None) -> dict[str, Any]:
         """Operational telemetry for the codec/vocoder stage (O2, R0 §8/§9).

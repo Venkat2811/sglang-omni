@@ -1,0 +1,27 @@
+# CSM-1B SHIP config (bf16 + cuda-graph ON + flashinfer) — RTX 3060 12 GB.
+# Derived from csm-1b-rtx3060.yaml; flips the M1-M3 correctness-baseline knobs
+# (disable_cuda_graph, eager attention) into the M4 ship target. dtype stays
+# bf16 (factory default). M2_REPORT proved fp32 frame-parity; bf16 ship quality
+# is gated PERCEPTUALLY downstream, never bit-exact.
+config_cls: CsmTtsPipelineConfig
+model_path: sesame/csm-1b
+name: csm-1b-ab-batched
+runtime_overrides:
+  preprocessing:
+    max_concurrency: 8
+  audio_encoder:
+    max_batch_size: 4
+  tts_engine:
+    max_new_tokens: 125
+    depth_batching: true
+    enable_async_decode: false
+    server_args_overrides:
+      max_running_requests: 8
+      mem_fraction_static: 0.5
+      cuda_graph_max_bs: 8
+      disable_cuda_graph: false           # SHIP: cuda-graph ON
+      attention_backend: flashinfer       # SHIP: flashinfer (bf16 has kernels)
+  vocoder:
+    stream_followup_stride: 6
+    stream_overlap_frames: 4
+    stream_holdback_frames: 2

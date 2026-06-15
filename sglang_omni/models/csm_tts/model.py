@@ -15,6 +15,7 @@ PLAN §1.7, §2.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, Tuple
 
@@ -162,6 +163,14 @@ class CsmTTSModel(nn.Module):
         # Depth-loop execution path (R0 §1): batched B=N across lanes (default)
         # or the per-lane B=1 safe fallback, selected by the model-config field.
         self._depth_batching = _resolve_depth_batching(config)
+        # Proof-from-log (not from flag): record which depth-loop execution path
+        # this boot resolved, so an A/B harness can confirm the codepath engaged
+        # from the server log rather than trusting the config knob alone.
+        logging.getLogger(__name__).info(
+            "CSM_DEPTH_BATCHING resolved=%s (path=%s)",
+            self._depth_batching,
+            "B=N fused depth loop" if self._depth_batching else "per-lane B=1 fallback",
+        )
         # frame_embedding is SHARED with the depth decoder (tied table);
         # depth KV is slot-indexed so max_slots = pool_size covers any batch.
         self.depth_decoder = CsmDepthDecoder(

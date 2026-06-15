@@ -38,6 +38,7 @@ change to the generic serving layer.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -48,12 +49,29 @@ from sglang_omni.models.csm_tts.utils import NUM_CODEBOOKS
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["prewarm_codec_decode", "prewarm_engine_frame_path"]
+__all__ = ["prewarm_codec_decode", "prewarm_engine_frame_path", "prewarm_disabled"]
 
 # A short synthetic frame count for the warmup decode — long enough to exercise
 # the conv-transpose ladder past its first frame (so per-frame kernels, not
 # just the prologue, are touched), short enough to keep boot fast.
 _WARMUP_FRAMES = 4
+
+# Framework-native operational env toggle (OSS-native, mirrors SGLang's
+# SGLANG_* env convention) to DISABLE boot pre-warm. Default: pre-warm ON.
+# This exists so an operator can A/B "does boot pre-warm crush first-request
+# TTFA?" on the same binary by flipping one env var — exactly the single-knob
+# discipline the bench harness uses. Set to "1"/"true"/"on"/"yes" to skip.
+_PREWARM_DISABLE_ENV = "SGLANG_OMNI_CSM_DISABLE_PREWARM"
+
+
+def prewarm_disabled() -> bool:
+    """True when boot pre-warm is disabled via ``SGLANG_OMNI_CSM_DISABLE_PREWARM``."""
+    return os.environ.get(_PREWARM_DISABLE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
 
 
 def prewarm_codec_decode(
@@ -76,6 +94,13 @@ def prewarm_codec_decode(
     can't decode zeros at boot will fail on the first real request too.
     """
     if max_batch_size < 1:
+        return
+    if prewarm_disabled():
+        logger.info(
+            "CSM codec decode pre-warm DISABLED via %s; first-audio latency "
+            "will pay the cold-start tax (intentional A/B arm)",
+            _PREWARM_DISABLE_ENV,
+        )
         return
     t0 = time.monotonic()
     try:
@@ -129,6 +154,12 @@ def prewarm_engine_frame_path(
     """
     runner = getattr(model_worker, "model_runner", None)
     if runner is None:
+        return
+    if prewarm_disabled():
+        logger.info(
+            "CSM engine frame-path pre-warm DISABLED via %s (intentional A/B arm)",
+            _PREWARM_DISABLE_ENV,
+        )
         return
     t0 = time.monotonic()
     # Try the conventional SGLang capture/warmup entry points in order; the
