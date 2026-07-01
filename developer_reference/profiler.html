@@ -55,11 +55,12 @@
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="RL Admin Control" href="rl_admin_control.html" />
     <link rel="prev" title="Communication" href="communication.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="Jun 09, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 01, 2026"/>
   </head>
   
   
@@ -163,6 +164,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/fishaudio_s2_pro.html">Fish Audio S2-Pro</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_tts.html">Qwen3 TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts.html">MOSS-TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts_local.html">MOSS-TTS-Local</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_asr.html">Qwen3-ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_omni.html">Qwen3-Omni</a></li>
@@ -187,6 +189,7 @@
 <li class="toctree-l1"><a class="reference internal" href="config.html">Config</a></li>
 <li class="toctree-l1"><a class="reference internal" href="communication.html">Communication</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Request-level profiler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rl_admin_control.html">RL Admin Control</a></li>
 </ul>
 
     </div>
@@ -514,9 +517,9 @@ first executable prefill / extend batch is selected.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">stage_first_stream_chunk_sent</span></code> (terminal stage → coordinator)</p></td>
 <td><p>same</p></td>
 </tr>
-<tr class="row-odd"><td><p>Talker request build start / end</p></td>
+<tr class="row-odd"><td><p>Talker request build execution start / end</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">scheduler_request_build_start</span></code> / <code class="docutils literal notranslate"><span class="pre">_end</span></code> (stage = talker)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">OmniScheduler.process_input_requests</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">OmniScheduler._run_request_builder</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p>Talker prefill start</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">scheduler_prefill_start</span></code> (stage = talker)</p></td>
@@ -792,6 +795,15 @@ from “talker prefill start”.</p></li>
         <p class="prev-next-title">Communication</p>
       </div>
     </a>
+    <a class="right-next"
+       href="rl_admin_control.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">RL Admin Control</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
 </div>
                 </footer>
               
@@ -853,7 +865,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jun 09, 2026.
+  Last updated on Jul 01, 2026.
   <br/>
 </p>
   </div>
