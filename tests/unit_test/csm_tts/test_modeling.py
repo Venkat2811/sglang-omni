@@ -148,6 +148,43 @@ def test_generate_frame_shapes_with_random_weights() -> None:
     assert torch.equal(frame2, frame)
 
 
+def test_generate_frame_excludes_cudnn_sdpa(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every SDPA call inside ``generate_frame`` must run with the cuDNN
+    backend disabled: cuDNN SDPA gets selected on Hopper for this
+    additive-mask + expanded-GQA layout and aborts at boot (#800 review,
+    H100). Asserts the guard at the actual dispatch site, not by reading the
+    implementation."""
+    cfg = _tiny_depth_cfg(num_codebooks=32, vocab_size=51)
+    fe = modeling.CsmFrameEmbedding(
+        cfg.num_codebooks, cfg.vocab_size, cfg.backbone_hidden_size
+    )
+    dd = modeling.CsmDepthDecoder(cfg, fe, max_slots=2)
+    _randomize(dd)
+
+    cudnn_states: list[bool] = []
+    real_sdpa = F.scaled_dot_product_attention
+
+    def recording_sdpa(*args, **kwargs):
+        cudnn_states.append(torch.backends.cuda.cudnn_sdp_enabled())
+        return real_sdpa(*args, **kwargs)
+
+    monkeypatch.setattr(modeling.F, "scaled_dot_product_attention", recording_sdpa)
+    bs = 1
+    h = torch.randn(bs, cfg.backbone_hidden_size)
+    cb0 = torch.randint(0, cfg.vocab_size, (bs,))
+    temps = torch.zeros(2)
+    topks = torch.full((2,), cfg.vocab_size, dtype=torch.long)
+    with torch.no_grad():
+        dd.generate_frame(h, cb0, temps, topks, bs=bs)
+
+    # 2 layers x 32 forward positions = 64 attention calls for the tiny cfg.
+    assert cudnn_states, "SDPA was never dispatched inside generate_frame"
+    assert not any(cudnn_states), (
+        "cuDNN SDPA backend was reachable inside generate_frame; the "
+        "sdpa_kernel guard is missing or ineffective"
+    )
+
+
 def _dense_layer_reference(layer, x, rope_cos, rope_sin):
     """Independent full-sequence reimplementation (no cache, naive attention)."""
     attn = layer.self_attn

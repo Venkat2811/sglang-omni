@@ -21,8 +21,19 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang_omni.models.csm_tts import sampler
+
+# cuDNN SDPA aborts at boot on Hopper for this attention's additive-mask +
+# repeat_interleave-expanded-GQA layout (PR #800 review, H100). Restrict
+# dispatch to backends validated on all archs; MATH keeps CPU (unit tests)
+# and MPS-less fallbacks alive.
+_DEPTH_SDPA_BACKENDS = [
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -448,28 +459,33 @@ class CsmDepthDecoder(nn.Module):
         k_cache = self.k_cache[:, :bs]
         v_cache = self.v_cache[:, :bs]
 
-        # Depth prefill, positions 0+1: position 0 is the RAW 2048-dim backbone
-        # hidden (replaces the placeholder embedding, modeling_csm.py:480-481);
-        # position 1 is cb0 embedded with codebook table 0. Both then pass the
-        # 2048→1024 projector (modeling_csm.py:488).
-        embeds = torch.stack(
-            [h_B2048, self.frame_embedding.embed_codebook(cb0_B, 0)], dim=1
-        )
-        h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=0)
-        prev = sampler.sample_codes_batched(
-            self.codebooks_head(h_last, 0).float(), temps, top_ks
-        )
-        codes = [cb0_B, prev]
-
-        # Positions 2..31: position p holds cb_{p-1} (table offset (p-1)*2051),
-        # head W[p-1] samples cb_p. cb31 (sampled at p=31) is never forwarded.
-        for p in range(2, self.num_codebooks):
-            embeds = self.frame_embedding.embed_codebook(prev, p - 1).unsqueeze(1)
-            h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=p)
-            prev = sampler.sample_codes_batched(
-                self.codebooks_head(h_last, p - 1).float(), temps, top_ks
+        # One backend guard around the whole frame (124 SDPA calls) instead of
+        # per attention call; see _DEPTH_SDPA_BACKENDS for why cuDNN is out.
+        with sdpa_kernel(_DEPTH_SDPA_BACKENDS):
+            # Depth prefill, positions 0+1: position 0 is the RAW 2048-dim
+            # backbone hidden (replaces the placeholder embedding,
+            # modeling_csm.py:480-481); position 1 is cb0 embedded with
+            # codebook table 0. Both then pass the 2048→1024 projector
+            # (modeling_csm.py:488).
+            embeds = torch.stack(
+                [h_B2048, self.frame_embedding.embed_codebook(cb0_B, 0)], dim=1
             )
-            codes.append(prev)
+            h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=0)
+            prev = sampler.sample_codes_batched(
+                self.codebooks_head(h_last, 0).float(), temps, top_ks
+            )
+            codes = [cb0_B, prev]
+
+            # Positions 2..31: position p holds cb_{p-1} (table offset
+            # (p-1)*2051), head W[p-1] samples cb_p. cb31 (sampled at p=31) is
+            # never forwarded.
+            for p in range(2, self.num_codebooks):
+                embeds = self.frame_embedding.embed_codebook(prev, p - 1).unsqueeze(1)
+                h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=p)
+                prev = sampler.sample_codes_batched(
+                    self.codebooks_head(h_last, p - 1).float(), temps, top_ks
+                )
+                codes.append(prev)
 
         return torch.stack(codes, dim=1)
 
