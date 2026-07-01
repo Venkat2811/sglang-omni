@@ -7,6 +7,7 @@ on machines without it).
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -119,6 +120,36 @@ def test_result_adapter_writes_usage_and_resets() -> None:
     assert state.prompt_tokens == 5
     assert state.output_frames == [list(range(32))]
     assert state.engine_time_s > 0
+
+
+def test_finish_reason_stop_vs_length(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Natural EOS frame → ``finish_reason="stop"`` and no warning; frame-cap
+    hit (``generation_done`` never set) → ``finish_reason="length"`` plus a
+    truncation warning naming the request — the #800 non-termination finding
+    made observable instead of silent."""
+    model = SimpleNamespace(reset_request=lambda rid: None)
+    rb, ra = request_builders.make_csm_scheduler_adapters(model)
+
+    data = rb(_payload(_state(prompt_len=5, max_new_tokens=10), rid="req-eos"))
+    data.output_frames.append(torch.zeros(32, dtype=torch.long))
+    data.generation_done = True
+    with caplog.at_level(logging.WARNING, logger=request_builders.__name__):
+        out = ra(data)
+    assert CsmTtsState.from_dict(out.data).finish_reason == "stop"
+    assert not caplog.records
+
+    caplog.clear()
+    data = rb(_payload(_state(prompt_len=5, max_new_tokens=2), rid="req-cap"))
+    data.output_frames.append(torch.arange(32, dtype=torch.long))
+    data.output_frames.append(torch.arange(32, dtype=torch.long))
+    with caplog.at_level(logging.WARNING, logger=request_builders.__name__):
+        out = ra(data)
+    state = CsmTtsState.from_dict(out.data)
+    assert state.finish_reason == "length"
+    warned = [r.getMessage() for r in caplog.records if "req-cap" in r.getMessage()]
+    assert len(warned) == 1 and "truncated" in warned[0]
 
 
 def test_stream_metadata_only_for_streaming_requests() -> None:

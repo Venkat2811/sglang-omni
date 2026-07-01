@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
@@ -31,6 +32,8 @@ from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 _TEXT_VOCAB_SIZE = 128_256
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -204,7 +207,9 @@ def build_csm_stream_metadata(
 
 def apply_csm_result(state: CsmTtsState, data: CsmSGLangRequestData) -> None:
     """Write ``output_frames`` + usage (prompt_tokens, completion_frames,
-    engine_time_s) back into ``state``."""
+    engine_time_s) + ``finish_reason`` ("stop" on a natural EOS frame,
+    "length" on a frame-cap hit) back into ``state``. Cap hits are truncated
+    mid-utterance, so they additionally log a warning."""
     if data.output_frames:
         # [F, 32] incl. the EOS frame (HF ``sequences`` parity; the vocoder
         # never received it).
@@ -215,6 +220,20 @@ def apply_csm_result(state: CsmTtsState, data: CsmSGLangRequestData) -> None:
         state.output_frames = None
         state.completion_frames = 0
     state.prompt_tokens = len(data.input_ids)
+    state.finish_reason = "stop" if data.generation_done else "length"
+    if not data.generation_done and state.completion_frames:
+        payload = getattr(data, "stage_payload", None)
+        logger.warning(
+            "csm_tts request %s hit the %d-frame cap (%.1f s of audio) "
+            "without emitting an EOS frame; the utterance is truncated. "
+            "CSM-1B does not terminate on a fraction of prompts (PR #800 "
+            "review measured ~17%% on seed-tts-eval EN); raising "
+            "max_new_tokens rarely helps — retry with different sampling "
+            "params or a different seed.",
+            payload.request_id if payload is not None else "<unknown>",
+            state.completion_frames,
+            state.completion_frames * 0.08,
+        )
 
 
 def make_csm_scheduler_adapters(

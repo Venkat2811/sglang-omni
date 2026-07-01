@@ -53,6 +53,9 @@ class CsmTtsState:
     prompt_tokens: int = 0
     completion_frames: int = 0
     engine_time_s: float = 0.0
+    # "stop" = natural EOS frame; "length" = frame cap hit, output truncated
+    # mid-utterance (CSM-1B does not terminate on a fraction of prompts).
+    finish_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise for ``StagePayload.data`` (sparse: omit None/empty;
@@ -82,6 +85,8 @@ class CsmTtsState:
             data["stream"] = True
         if self.output_frames is not None:
             data["output_frames"] = self.output_frames
+        if self.finish_reason is not None:
+            data["finish_reason"] = self.finish_reason
         for key in ("prompt_tokens", "completion_frames", "engine_time_s"):
             value = getattr(self, key)
             if value:
@@ -110,6 +115,7 @@ class CsmTtsState:
             prompt_tokens=data.get("prompt_tokens", 0),
             completion_frames=data.get("completion_frames", 0),
             engine_time_s=data.get("engine_time_s", 0.0),
+            finish_reason=data.get("finish_reason"),
         )
 
 
