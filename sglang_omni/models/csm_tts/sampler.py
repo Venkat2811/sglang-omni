@@ -14,6 +14,7 @@ and depth (CSM-private, from ``req._omni_data``).
 from __future__ import annotations
 
 import torch
+from sglang.srt.layers.sampler import multinomial_with_seed
 
 from sglang_omni.models.csm_tts.utils import (
     CODEBOOK_EOS,
@@ -25,6 +26,7 @@ from sglang_omni.models.csm_tts.utils import (
 __all__ = [
     "CsmBatchedSamplerState",
     "K_MAX",
+    "NO_SEED",
     "STAGING_WIDTH",
     "frame_finalize_direct",
     "sample_codes_batched",
@@ -33,6 +35,11 @@ __all__ = [
 
 # Greedy short-circuit threshold (higgs sampler.py parity).
 _GREEDY_TEMP_THRESHOLD = 1e-5
+
+# Sentinel seed for rows with no user seed (#824, higgs parity): keeps the
+# legacy unseeded torch.multinomial path, so unseeded decode is
+# byte-identical to before.
+NO_SEED = -1
 
 # Packed D2H staging row layout: ``[c0..c31 | was_done |
 # generation_done]`` int64 — model.py allocates ``_cg_collect_staging
@@ -51,13 +58,18 @@ class CsmBatchedSamplerState:
       ``CsmFrameEmbedding`` on the next decode step.
     - ``generation_done``: bool ``[P]`` — EOS latched; row frozen.
     - ``frames_emitted``: int32 ``[P]`` — frames appended so far.
+    - ``seeds``: int64 ``[P]`` — per-request sampling seed (#824;
+      ``NO_SEED`` = unseeded), constant across the request's AR steps.
+    - ``step_count``: int64 ``[P]`` — monotonic frame index; seeds each
+      ``(frame, codebook)`` draw reproducibly.
 
     No ``delay_count`` / ``eoc_countdown`` — CSM has neither.
     """
 
     def __init__(self, pool_size: int, device: torch.device | str = "cuda") -> None:
         """Allocate ``last_codes [P, 32]`` int64, ``generation_done [P]`` bool,
-        ``frames_emitted [P]`` int32 on ``device``."""
+        ``frames_emitted [P]`` int32, ``seeds [P]``/``step_count [P]`` int64
+        on ``device``."""
         self.pool_size = int(pool_size)
         self.device = torch.device(device)
         self.last_codes = torch.zeros(
@@ -69,13 +81,22 @@ class CsmBatchedSamplerState:
         self.frames_emitted = torch.zeros(
             self.pool_size, dtype=torch.int32, device=self.device
         )
+        self.seeds = torch.full(
+            (self.pool_size,), NO_SEED, dtype=torch.int64, device=self.device
+        )
+        self.step_count = torch.zeros(
+            self.pool_size, dtype=torch.int64, device=self.device
+        )
 
     def reset_row(self, row: int) -> None:
         """Reset one pool row to the fresh-request state
-        (``last_codes=0``, ``generation_done=False``, ``frames_emitted=0``)."""
+        (``last_codes=0``, ``generation_done=False``, ``frames_emitted=0``,
+        ``seeds=NO_SEED``, ``step_count=0``)."""
         self.last_codes[row].zero_()
         self.generation_done[row] = False
         self.frames_emitted[row] = 0
+        self.seeds[row] = NO_SEED
+        self.step_count[row] = 0
 
 
 def sample_codes_batched(
@@ -83,6 +104,9 @@ def sample_codes_batched(
     temperature_B: torch.Tensor,
     top_k_buf_B: torch.Tensor,
     top_p_B: torch.Tensor | None = None,
+    *,
+    seeds_B: torch.Tensor | None = None,
+    positions_B: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Branchless per-row greedy/top-k sampling (higgs
     ``_sample_independent_batched`` with ``K_MAX=2051``).
@@ -92,11 +116,23 @@ def sample_codes_batched(
     ``topk(K_MAX)`` + per-row k-th-value gather (CG-deterministic at temp=0).
     Used for BOTH cb0 and every one of the 31 depth steps.
 
+    Seeded rows (#824, higgs template): when ``seeds_B`` is given, rows with
+    ``seed >= 0`` draw via ``multinomial_with_seed`` keyed on
+    ``(seed, position)`` — reproducible per request at any batch size —
+    while ``NO_SEED`` rows keep the ``torch.multinomial`` draw above.
+    Selection is branchless (compute both, ``torch.where``) so it is legal
+    inside a captured CUDA graph.
+
     Args:
         logits_BV_fp32: fp32 ``[B, 2051]`` (callers cast before this).
         temperature_B: fp32 ``[B]``.
         top_k_buf_B: int64 ``[B]`` (neutral rows carry ``K_MAX``).
         top_p_B: optional fp32 ``[B]``.
+        seeds_B: optional int64 ``[B]`` per-row seeds (``NO_SEED`` = unseeded).
+        positions_B: int64 ``[B]`` per-draw positions, unique per
+            ``(frame_step, codebook)`` — callers pass
+            ``frame_step * 32 + codebook_idx``. Required when ``seeds_B``
+            is given.
 
     Returns:
         int64 ``[B]`` sampled codes in ``[0, 2050]``.
@@ -136,6 +172,18 @@ def sample_codes_batched(
 
     probs = logits.softmax(dim=-1)
     sampled_B = probs.multinomial(num_samples=1).squeeze(-1)
+
+    if seeds_B is not None:
+        if positions_B is None:
+            raise ValueError("positions_B is required when seeds_B is given")
+        # Seeded rows draw deterministically from (seed, position); unseeded
+        # rows (seed == NO_SEED) keep the torch.multinomial draw above.
+        # clamp_min keeps the sentinel inside multinomial_with_seed's
+        # positive-seed domain; the where discards those draws.
+        seeded_B = multinomial_with_seed(
+            torch.log(probs), seeds_B.clamp_min(0), positions_B
+        ).squeeze(-1)
+        sampled_B = torch.where(seeds_B >= 0, seeded_B, sampled_B)
 
     return torch.where(greedy_B, argmax_B, sampled_B).to(torch.long)
 

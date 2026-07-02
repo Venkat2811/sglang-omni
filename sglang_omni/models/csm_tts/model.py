@@ -35,6 +35,7 @@ from sglang_omni.models.csm_tts.hf_config import (
 from sglang_omni.models.csm_tts.modeling import CsmDepthDecoder, CsmFrameEmbedding
 from sglang_omni.models.csm_tts.sampler import (
     K_MAX,
+    NO_SEED,
     STAGING_WIDTH,
     CsmBatchedSamplerState,
     frame_finalize_direct,
@@ -42,6 +43,7 @@ from sglang_omni.models.csm_tts.sampler import (
 )
 from sglang_omni.models.csm_tts.utils import NUM_CODEBOOKS
 from sglang_omni.models.csm_tts.weight_loader import CsmWeightMapper
+from sglang_omni.sampling.seed import resolve_row_seed
 
 _DEFAULT_MAX_BATCH_SIZE = 64
 
@@ -102,7 +104,9 @@ class CsmTTSModel(nn.Module):
     ``_cg_codes_BN`` (long [P, 32]), ``_cg_collect_staging`` (long [P, 34] =
     ``c0..c31 | was_done | generation_done``), ``_cg_was_done`` (bool),
     ``_cg_active_generation_done`` (bool), ``_cg_active_last_codes``
-    (long [P, 32]).
+    (long [P, 32]), ``_cg_active_seeds`` (long, NO_SEED = unseeded) +
+    ``_cg_active_step_count`` (long) — the #824 per-request sampling seed
+    and frame index.
 
 
     """
@@ -191,6 +195,14 @@ class CsmTTSModel(nn.Module):
         self._cg_active_last_codes = torch.zeros(
             pool_size, NUM_CODEBOOKS, dtype=torch.long, device=device
         )
+        # #824 unified sampling seed: per-row seed (NO_SEED = unseeded) and
+        # frame index, gathered from the pool each decode step.
+        self._cg_active_seeds = torch.full(
+            (pool_size,), NO_SEED, dtype=torch.long, device=device
+        )
+        self._cg_active_step_count = torch.zeros(
+            pool_size, dtype=torch.long, device=device
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
@@ -220,6 +232,15 @@ class CsmTTSModel(nn.Module):
         self._rid_to_row[req_id] = row
         self._sampler_pool.reset_row(row)
         return row
+
+    def set_request_seed(self, req_id: str, seed: int | None) -> None:
+        """Pin ``req_id``'s sampler seed (``None`` -> unseeded/random). Constant
+        across the request's AR steps; consumed by ``multinomial_with_seed``
+        (#824, higgs verbatim)."""
+        row = self.acquire_row(req_id)
+        self._sampler_pool.seeds[row] = (
+            NO_SEED if seed is None else resolve_row_seed(seed)
+        )
 
     def release_row(self, req_id: str) -> None:
         """Return the row bound to ``req_id`` to the free list (idempotent)."""
@@ -352,12 +373,18 @@ class CsmTTSModel(nn.Module):
         """
         bs = int(hidden_BD.shape[0])
 
+        seeds_B = self._cg_active_seeds[:bs]
+        step_B = self._cg_active_step_count[:bs]
         logits0 = self.codebook0_head(hidden_BD).to(torch.float32)
+        # cb0 draws at position step*32; depth codebook p at step*32 + p —
+        # unique per (frame, codebook) so seeded draws never collide (#824).
         cb0_B = sample_codes_batched(
             logits0,
             self._cg_temperature[:bs],
             self._cg_top_k_buf[:bs],
             self._cg_top_p[:bs],
+            seeds_B=seeds_B,
+            positions_B=step_B * self._num_codebooks,
         )
         codes_B32 = self.depth_decoder.generate_frame(
             hidden_BD,
@@ -365,6 +392,8 @@ class CsmTTSModel(nn.Module):
             self._cg_depth_temperature,
             self._cg_depth_top_k_buf,
             bs=bs,
+            seeds_B=seeds_B,
+            step_B=step_B,
         )
 
         last_codes_in = self._cg_active_last_codes[:bs]
@@ -373,6 +402,9 @@ class CsmTTSModel(nn.Module):
         )
         self._cg_was_done[:bs] = was_done
         self._cg_active_generation_done[:bs] = new_done
+        # Advance the frame index for rows that consumed this step (higgs
+        # `new_step_count = step_count + active` with active = ~was_done).
+        self._cg_active_step_count[:bs] = step_B + (~was_done).to(torch.long)
         # Frozen rows keep their previous frame (raw sampled codes stay in
         # embed range; STOP_CODE=-1 must never reach frame_embedding).
         self._cg_active_last_codes[:bs] = torch.where(
@@ -450,12 +482,29 @@ class CsmTTSModel(nn.Module):
             device=device,
         )
 
-        cb0_B = sample_codes_batched(logits0, temperature, top_k_buf, top_p)
+        pool = self._sampler_pool
+        # Seeds were pinned by set_request_seed at before_prefill (#824);
+        # frame 0 draws at positions step*32 + codebook with step == 0.
+        seeds_B = pool.seeds[row_indices]
+        step_B = pool.step_count[row_indices]
+        cb0_B = sample_codes_batched(
+            logits0,
+            temperature,
+            top_k_buf,
+            top_p,
+            seeds_B=seeds_B,
+            positions_B=step_B * self._num_codebooks,
+        )
         codes_B32 = self.depth_decoder.generate_frame(
-            hidden_BD, cb0_B, depth_temperature, depth_top_k_buf, bs=batch_size
+            hidden_BD,
+            cb0_B,
+            depth_temperature,
+            depth_top_k_buf,
+            bs=batch_size,
+            seeds_B=seeds_B,
+            step_B=step_B,
         )
 
-        pool = self._sampler_pool
         out_codes, new_done, was_done = frame_finalize_direct(
             codes_B32, pool.generation_done[row_indices]
         )
@@ -464,6 +513,7 @@ class CsmTTSModel(nn.Module):
             was_done.unsqueeze(-1), pool.last_codes[row_indices], codes_B32
         )
         pool.frames_emitted[row_indices] += (~was_done).to(torch.int32)
+        pool.step_count[row_indices] += (~was_done).to(torch.long)
 
         # Note: one D2H per step to skip STOP-sentinel rows in the append loop
         # (higgs pattern).

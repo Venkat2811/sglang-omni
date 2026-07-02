@@ -69,10 +69,13 @@ def _build_runner(
         _cg_collect_staging=torch.zeros(
             (n, NUM_CODEBOOKS + 2), dtype=torch.long, device=device
         ),
+        # #824: the pack scatters the in-graph-advanced frame index back.
+        _cg_active_step_count=torch.zeros(n, dtype=torch.long, device=device),
         _sampler_pool=SimpleNamespace(
             generation_done=torch.zeros(n, dtype=torch.bool, device=device),
             last_codes=torch.zeros((n, NUM_CODEBOOKS), dtype=torch.long, device=device),
             frames_emitted=torch.zeros(n, dtype=torch.int32, device=device),
+            step_count=torch.zeros(n, dtype=torch.long, device=device),
         ),
     )
     reqs = [

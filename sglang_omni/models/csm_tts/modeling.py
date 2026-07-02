@@ -430,6 +430,8 @@ class CsmDepthDecoder(nn.Module):
         top_ks_B: torch.Tensor,
         *,
         bs: int,
+        seeds_B: torch.Tensor | None = None,
+        step_B: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the 31-step depth AR for one frame, batched across ``[:bs]``.
 
@@ -448,6 +450,12 @@ class CsmDepthDecoder(nn.Module):
             temps_B: fp32 ``[B]`` depth temperatures (CSM-private param set).
             top_ks_B: int64 ``[B]`` depth top-k buffer (K_MAX for neutral rows).
             bs: live CG batch size (buffers are sliced ``[:bs]``).
+            seeds_B: optional int64 per-row sampling seeds (#824;
+                ``NO_SEED`` rows stay unseeded).
+            step_B: int64 per-row frame index; depth codebook ``p`` draws at
+                position ``step * num_codebooks + p`` — unique per
+                ``(frame, codebook)``, disjoint from cb0's position
+                (``step * num_codebooks``). Required with ``seeds_B``.
 
         Returns:
             int64 ``[B, 32]`` — full frame ``[cb0 | cb1..cb31]``.
@@ -456,6 +464,8 @@ class CsmDepthDecoder(nn.Module):
         assert h_B2048.shape[0] == bs and cb0_B.shape[0] == bs
         temps = temps_B[:bs]
         top_ks = top_ks_B[:bs]
+        seeds = None if seeds_B is None else seeds_B[:bs]
+        pos_base = None if step_B is None else step_B[:bs] * self.num_codebooks
         k_cache = self.k_cache[:, :bs]
         v_cache = self.v_cache[:, :bs]
 
@@ -472,7 +482,11 @@ class CsmDepthDecoder(nn.Module):
             )
             h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=0)
             prev = sampler.sample_codes_batched(
-                self.codebooks_head(h_last, 0).float(), temps, top_ks
+                self.codebooks_head(h_last, 0).float(),
+                temps,
+                top_ks,
+                seeds_B=seeds,
+                positions_B=None if pos_base is None else pos_base + 1,
             )
             codes = [cb0_B, prev]
 
@@ -483,7 +497,11 @@ class CsmDepthDecoder(nn.Module):
                 embeds = self.frame_embedding.embed_codebook(prev, p - 1).unsqueeze(1)
                 h_last = self._forward_step(embeds, k_cache, v_cache, write_pos=p)
                 prev = sampler.sample_codes_batched(
-                    self.codebooks_head(h_last, p - 1).float(), temps, top_ks
+                    self.codebooks_head(h_last, p - 1).float(),
+                    temps,
+                    top_ks,
+                    seeds_B=seeds,
+                    positions_B=None if pos_base is None else pos_base + p,
                 )
                 codes.append(prev)
 

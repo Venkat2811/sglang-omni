@@ -17,6 +17,7 @@ Stubbed contracts (kept 1:1 with the upstream call shapes used by csm_tts):
 - ``sglang.srt.sampling.sampling_params.SamplingParams`` — kwargs incl.
   ``sampling_seed``; ``normalize(tokenizer)`` sets ``stop_strs``.
 - ``sglang.srt.layers.logits_processor.LogitsProcessorOutput``.
+- ``sglang.srt.layers.sampler.multinomial_with_seed`` — CPU reference below.
 """
 
 from __future__ import annotations
@@ -25,6 +26,53 @@ import sys
 import types
 from types import SimpleNamespace
 from typing import Any
+
+import pytest
+import torch
+
+
+def reference_multinomial_with_seed(
+    logprobs: "torch.Tensor", seed: "torch.Tensor", positions: "torch.Tensor"
+) -> "torch.Tensor":
+    """Pure-torch CPU stand-in for sglang's ``multinomial_with_seed``.
+
+    Implements the upstream CONTRACT (sglang layers/sampler.py docstring):
+    a deterministic batched draw where row ``i`` is a pure function of
+    ``(logprobs[i], seed[i], positions[i])`` — Gumbel-max over per-row
+    hash-keyed uniforms. The real kernel hashes with Triton murmur3 (CUDA
+    only); the exact stream differs here, but every property csm_tts relies
+    on (same (seed, position) → same draw; different seed/position →
+    decorrelated draw; row independence) holds identically.
+    """
+    n, m = logprobs.shape
+    out = torch.empty(n, 1, dtype=torch.long, device=logprobs.device)
+    for i in range(n):
+        key = (int(seed[i]) * 1_000_003 + int(positions[i])) % (2**63 - 1)
+        gen = torch.Generator(device="cpu").manual_seed(key)
+        u = torch.rand(m, generator=gen).clamp_min(1e-12)
+        gumbel = -torch.log(-torch.log(u))
+        scores = logprobs[i].detach().to("cpu", torch.float64) + gumbel.to(
+            torch.float64
+        )
+        out[i, 0] = scores.argmax()
+    return out
+
+
+@pytest.fixture
+def cpu_multinomial_with_seed(monkeypatch: pytest.MonkeyPatch):
+    """Route csm_tts's seeded draws through the CPU reference.
+
+    Needed whenever a CPU test reaches the seeded path with REAL sglang
+    installed: the real ``multinomial_with_seed`` is Triton/CUDA-only, so
+    CPU tensors would fail. With the stub installed (no sglang) this is a
+    no-op re-bind of the same contract.
+    """
+    from sglang_omni.models.csm_tts import sampler as csm_sampler
+
+    monkeypatch.setattr(
+        csm_sampler, "multinomial_with_seed", reference_multinomial_with_seed
+    )
+    return reference_multinomial_with_seed
 
 
 def _install_sglang_stub() -> None:
@@ -148,6 +196,10 @@ def _install_sglang_stub() -> None:
     _module(
         "sglang.srt.layers.logits_processor",
         LogitsProcessorOutput=LogitsProcessorOutput,
+    )
+    _module(
+        "sglang.srt.layers.sampler",
+        multinomial_with_seed=reference_multinomial_with_seed,
     )
 
 

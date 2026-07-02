@@ -72,6 +72,13 @@ class CsmTTSModelRunner(ModelRunner):
     ) -> None:
         del schedule_batch
         forward_batch.req_ids = [req.request_id for req in requests]
+        # #824 unified sampling seed: pin each request's SamplingParams
+        # sampling_seed onto its sampler-pool row (higgs template; idempotent
+        # under chunked prefill — same value re-pinned per chunk).
+        for req in requests:
+            self.model.set_request_seed(
+                req.request_id, req.data.req.sampling_params.sampling_seed
+            )
         # Depth sampling params are CSM-private (never on sampling_info);
         # stamp per-row (temperature, top_k) tuples so
         # model._extract_batch_metadata can read them.
@@ -272,6 +279,8 @@ class CsmTTSModelRunner(ModelRunner):
         pool = model._sampler_pool
         model._cg_active_generation_done[:bs] = pool.generation_done[rows_t]
         model._cg_active_last_codes[:bs] = pool.last_codes[rows_t]
+        model._cg_active_seeds[:bs] = pool.seeds[rows_t]
+        model._cg_active_step_count[:bs] = pool.step_count[rows_t]
 
     @staticmethod
     def _extract_decode_sampling_params(forward_batch: Any, n_real: int) -> Any:
@@ -355,6 +364,8 @@ class CsmTTSModelRunner(ModelRunner):
         pool = model._sampler_pool
         pool.generation_done[rows_t] = model._cg_active_generation_done[:n_real]
         pool.last_codes[rows_t] = model._cg_active_last_codes[:n_real]
+        # Frame index advanced in-graph (#824); seeds are read-only in decode.
+        pool.step_count[rows_t] = model._cg_active_step_count[:n_real]
         # Bookkeeping only (nothing downstream reads it); under lookahead
         # reroute duplicate padding-row indices make this last-write-wins,
         # which is fine — the padding row is reset every step.
