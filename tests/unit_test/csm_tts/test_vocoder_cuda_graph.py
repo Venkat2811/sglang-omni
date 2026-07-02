@@ -8,6 +8,16 @@ NOTHING here mocks ``torch.cuda`` — a mocked "bit-identity" test would be a
 lie. The REAL bit-identity gate (``torch.equal`` graph-vs-eager on the actual
 Mimi weights) is the CUDA-gated test at the bottom and runs on the RTX 3060
 with ``CSM_CKPT=<sesame/csm-1b dir>``.
+
+Post-3060 regression tier: the first GPU run found transformers' Mimi decode
+aborting capture (unpinned H2D copy in the RVQ zero-init; D2H sync from the
+int64-buffer padding math in ``F.pad``) — the graph sealed EMPTY and replay
+was a no-op while the CPU mocked-replay tests stayed green. Two nets below:
+the runner's boot-time ``_replay_self_check`` (no-op / non-bit-identical
+replay must raise → that T drops to eager) and CPU value-identity checks of
+the two capture-legality patches against real transformers modules. The
+capture-legality violations THEMSELVES only manifest under real stream
+capture, so proving capture works stays GPU-tier-only.
 """
 
 from __future__ import annotations
@@ -335,6 +345,88 @@ def test_capture_uses_thread_local_error_mode() -> None:
         for call in graph_calls
         for keyword in call.keywords
     ), "CSM Mimi vocoder CUDA graph capture must use thread-local error mode"
+
+
+# --- boot-time replay self-check (RTX 3060 empty-capture regression) ----------
+
+
+def test_replay_self_check_catches_empty_noop_replay() -> None:
+    """Regression net for the observed 3060 failure mode: capture aborts
+    inside the model (capture_end warns "The CUDA Graph is empty"), replay
+    is a NO-OP, and the static output keeps stale garbage. The boot-time
+    self-check poisons the output first, so a no-op replay must raise and
+    warmup drops that T to eager instead of shipping corrupt audio."""
+    static = torch.zeros(1, 1, 4 * SPF)
+    ref = torch.randn(1, 1, 4 * SPF)
+    with pytest.raises(RuntimeError, match="recorded no work"):
+        CsmMimiVocoderCudaGraphRunner._replay_self_check(lambda: None, static, ref)
+
+
+def test_replay_self_check_rejects_non_bit_identical_replay() -> None:
+    static = torch.zeros(1, 1, SPF)
+    ref = torch.randn(1, 1, SPF)
+
+    def replay() -> None:
+        static.copy_(ref + 1e-3)
+
+    with pytest.raises(RuntimeError, match="not bit-identical"):
+        CsmMimiVocoderCudaGraphRunner._replay_self_check(replay, static, ref)
+
+
+def test_replay_self_check_passes_bit_identical_replay() -> None:
+    static = torch.zeros(1, 1, SPF)
+    ref = torch.randn(1, 1, SPF)
+
+    def replay() -> None:
+        static.copy_(ref)
+
+    CsmMimiVocoderCudaGraphRunner._replay_self_check(replay, static, ref)
+
+
+# --- capture-legality patches: value identity on real transformers (CPU) ------
+
+
+def test_patch_mimi_codec_value_identity_and_idempotence() -> None:
+    """The two capture-legality patches (RVQ device-side zero init;
+    MimiConv1d host-int padding math) must be bitwise NO-OPS for eager —
+    patched outputs torch.equal unpatched outputs on real transformers
+    modules — and re-patching must not double-wrap."""
+    pytest.importorskip("transformers")
+    from transformers.models.mimi.configuration_mimi import MimiConfig
+    from transformers.models.mimi.modeling_mimi import (
+        MimiConv1d,
+        MimiResidualVectorQuantizer,
+    )
+
+    from sglang_omni.models.csm_tts.vocoder_cuda_graph import (
+        patch_mimi_codec_for_cuda_graph,
+    )
+
+    torch.manual_seed(0)
+    config = MimiConfig()
+    conv = MimiConv1d(config, 4, 8, kernel_size=7, stride=2).eval()
+    rvq = MimiResidualVectorQuantizer(config, num_quantizers=2).eval()
+    for layer in rvq.layers:  # default embed_sum is all-zero -> randomize
+        layer.codebook.embed_sum.normal_()
+    root = torch.nn.ModuleDict({"conv": conv, "rvq": rvq})
+
+    x = torch.randn(1, 4, 50)
+    codes = torch.randint(0, config.codebook_size, (1, 2, 10))
+    with torch.no_grad():
+        conv_ref = conv(x)
+        rvq_ref = rvq.decode(codes)
+
+    patch_mimi_codec_for_cuda_graph(root)
+    assert hasattr(conv, "_sglang_omni_original_conv_forward")
+    assert hasattr(rvq, "_sglang_omni_original_rvq_decode")
+    with torch.no_grad():
+        assert torch.equal(conv(x), conv_ref), "patched MimiConv1d diverged"
+        assert torch.equal(rvq.decode(codes), rvq_ref), "patched RVQ diverged"
+
+    decode_before, forward_before = rvq.decode, conv.forward
+    patch_mimi_codec_for_cuda_graph(root)  # idempotent: no re-wrap
+    assert rvq.decode is decode_before
+    assert conv.forward is forward_before
 
 
 # --- THE bit-identity gate (CUDA + real weights; RTX 3060) --------------------

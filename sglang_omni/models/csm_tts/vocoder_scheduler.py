@@ -35,8 +35,10 @@ per streaming window length T at B=1 over the STATELESS
 (uncaptured T, batched decodes, the optional stateful
 ``decoder_past_key_values`` path, CPU boxes) serves eager. Escape hatch:
 ``cuda_graph=False`` (ctor) or env ``CSM_VOCODER_CUDA_GRAPH=0``. See
-``vocoder_cuda_graph.py`` for the exact capture boundary and why the
-stateless path needs no MOSS-style cache patch.
+``vocoder_cuda_graph.py`` for the exact capture boundary, the two
+value-identical capture-legality patches transformers' Mimi needs, and the
+per-T boot-time replay self-check that drops any non-bit-identical (or
+silently empty) capture to eager.
 
 The three OOB fences: (1) engine never streams EOS/STOP frames;
 (2) ``sanitize_for_mimi`` clamp + counter on every matrix entering Mimi;
@@ -308,8 +310,13 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
             return
         from sglang_omni.models.csm_tts.vocoder_cuda_graph import (
             CsmMimiVocoderCudaGraphRunner,
+            patch_mimi_codec_for_cuda_graph,
         )
 
+        # Rebind Mimi's two capture-hostile idioms to value-identical,
+        # capture-legal forms BEFORE capture (MOSS patch-then-warmup order);
+        # patched eager stays bitwise equal to upstream HF.
+        patch_mimi_codec_for_cuda_graph(self._codec.model)
         frames = self._cuda_graph_capture_frames()
         runner = CsmMimiVocoderCudaGraphRunner(
             self._codec.model,

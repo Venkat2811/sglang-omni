@@ -8,18 +8,33 @@ never lazily in the serving loop.
 Structural simplification vs MOSS: CSM's shipped vocoder path is the
 stateless overlap-trim ``MimiModel.decode`` — no streaming KV cache, no conv
 padding cache (the bundled codec_config ships ``use_cache=False``), so the
-WHOLE decode forward is the capture region and no in-place cache patch
-(MOSS's ``patch_codec_attention_cache_for_cuda_graph``) is needed for
-bit-identity.
+WHOLE decode forward is the capture region and no STATE patch (MOSS's
+``patch_codec_attention_cache_for_cuda_graph``) is needed for bit-identity.
+
+Two capture-LEGALITY patches are needed instead
+(:func:`patch_mimi_codec_for_cuda_graph`, applied by the scheduler's
+``warmup_now`` before capture) — both measured on the RTX 3060 against
+transformers 5.6.0, both value-identical so patched eager stays bitwise
+equal to upstream HF:
+
+1. ``MimiResidualVectorQuantizer.decode`` initializes its accumulator with
+   ``torch.tensor(0.0, device=codes.device)`` — a CPU-scalar construction +
+   unpinned H2D copy, which raises ``Cannot copy between CPU and CUDA
+   tensors during CUDA graph capture`` (and capture_end then warns "The
+   CUDA Graph is empty"). Patched to a device-side ``torch.zeros(())``.
+2. ``MimiConv1d`` keeps ``kernel_size``/``stride``/``padding_total`` as
+   int64 CUDA buffers; ``F.pad`` coerces the resulting 0-d CUDA scalars via
+   ``__index__`` → a D2H sync → ``operation not permitted when stream is
+   capturing``. Patched to pre-read host ints with the same ceil
+   arithmetic (integers here are ≪ 2**24, exact in the upstream fp32
+   tensor math, so the results are identical).
 
 Capture boundary:
 
 - CAPTURED: ``MimiModel.decode(codes[1, 32, T])`` for each warmup T —
   quantizer embed → upsample conv-transpose → decoder transformer
-  (sliding-window causal mask) → SEANet conv stack. A pure function of the
-  codes at fixed shape: transformers' modeling_mimi has no ``.item()`` host
-  syncs on this path and builds masks/positions device-side (verified
-  against transformers 5.6.0).
+  (sliding-window causal mask) → SEANet conv stack — after the two patches
+  above. A pure function of the codes at fixed shape.
 - EAGER (``None`` fallback, selected by :meth:`decode`): any T not captured
   (non-streaming full-utterance decodes run T up to the 125-frame cap), any
   ``B != 1`` (``decode_batch`` multi-item buckets), and non-CUDA inputs.
@@ -34,15 +49,19 @@ fp32 discipline: the runner captures whatever dtype the codec was loaded in
 nor outputs.
 
 Bit-identity is the bar: replayed output must ``torch.equal`` the eager
-output for the same codes. The real gate is CUDA-only
-(tests/unit_test/csm_tts/test_vocoder_cuda_graph.py) and runs on the
-RTX 3060.
+output for the same codes — enforced TWICE: per-T at boot by
+:meth:`CsmMimiVocoderCudaGraphRunner._replay_self_check` (a poisoned-output
+replay compared against an eager reference; an empty/no-op capture or a
+non-bit-identical replay drops that T to eager), and by the CUDA gate in
+tests/unit_test/csm_tts/test_vocoder_cuda_graph.py on the RTX 3060.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterable
+from types import MethodType
 from typing import NamedTuple
 
 import torch
@@ -57,6 +76,119 @@ class _CapturedVocoderGraph(NamedTuple):
     graph: torch.cuda.CUDAGraph
     static_codes: torch.Tensor  # int64 [1, 32, T]
     static_audio: torch.Tensor  # [1, 1, T * 1920], codec dtype
+
+
+_ORIG_RVQ_DECODE_ATTR = "_sglang_omni_original_rvq_decode"
+_ORIG_CONV_FORWARD_ATTR = "_sglang_omni_original_conv_forward"
+
+
+def _cuda_graph_rvq_decode(self, codes: torch.Tensor) -> torch.Tensor:
+    """Value-identical rewrite of transformers'
+    ``MimiResidualVectorQuantizer.decode`` (5.6.0): the ONLY change is the
+    accumulator init — ``torch.zeros((), device=...)`` allocates the 0-d
+    fp32 zero device-side, where upstream's ``torch.tensor(0.0, device=...)``
+    constructs on CPU and does an unpinned H2D copy (illegal during graph
+    capture). Same value, dtype, shape ⇒ every subsequent op is unchanged."""
+    quantized_out = torch.zeros((), device=codes.device)
+    codes = codes.transpose(0, 1)
+    for i, indices in enumerate(codes):
+        layer = self.layers[i]
+        quantized = layer.decode(indices)
+        quantized_out = quantized_out + quantized
+
+    if self.output_proj is not None:
+        quantized_out = self.output_proj(quantized_out)
+    return quantized_out
+
+
+def _cuda_graph_conv1d_forward(self, hidden_states, padding_cache=None):
+    """Value-identical rewrite of transformers' ``MimiConv1d.forward``
+    (5.6.0): the padding arithmetic runs on host ints pre-read at patch time
+    (upstream registers ``kernel_size``/``stride``/``padding_total`` as int64
+    CUDA buffers; ``F.pad`` coerces those 0-d CUDA scalars via ``__index__``
+    → a D2H sync, illegal during graph capture). Exactness: the magnitudes
+    here are ≪ 2**24, where upstream's fp32 tensor division/ceil is exact,
+    so the host math yields identical padding."""
+    length = int(hidden_states.shape[-1])
+    kernel_size = self._sglang_omni_kernel_size
+    stride = self._sglang_omni_stride
+    padding_total = self._sglang_omni_padding_total
+    n_frames = math.ceil((length - kernel_size + padding_total) / stride + 1) - 1
+    extra_padding = n_frames * stride + kernel_size - padding_total - length
+
+    if not self.causal and padding_cache is not None:
+        raise ValueError("`padding_cache` is not supported for non-causal convolutions.")
+
+    if self.causal and padding_cache is not None:
+        layer_padding_cache = padding_cache.update(hidden_states, self.layer_idx)
+        hidden_states = torch.cat([layer_padding_cache, hidden_states], dim=2)
+    elif self.causal:
+        hidden_states = self._pad1d(
+            hidden_states, (padding_total, extra_padding), mode=self.pad_mode
+        )
+    else:
+        hidden_states = self._pad1d(
+            hidden_states,
+            (
+                self._sglang_omni_padding_left,
+                self._sglang_omni_padding_right + extra_padding,
+            ),
+            mode=self.pad_mode,
+        )
+    return self.conv(hidden_states)
+
+
+def patch_mimi_codec_for_cuda_graph(model) -> None:
+    """Rebind transformers Mimi's two capture-hostile idioms to
+    value-identical, capture-legal forms (module docstring, items 1-2) —
+    the MOSS ``patch_codec_attention_cache_for_cuda_graph`` analogue.
+    Idempotent (originals stashed once); modules with an unexpected layout
+    are skipped with a warning (their captures then fail per-T → eager).
+    The patched EAGER path stays bitwise equal to upstream HF, so applying
+    the patch never changes served audio."""
+    for module in model.modules():
+        name = type(module).__name__
+        if name == "MimiResidualVectorQuantizer":
+            if hasattr(module, _ORIG_RVQ_DECODE_ATTR):
+                continue
+            decode = getattr(module, "decode", None)
+            if not callable(decode) or not hasattr(module, "layers"):
+                logger.warning(
+                    "MimiResidualVectorQuantizer layout unexpected; skipping "
+                    "CUDA-graph zero-init patch (capture may fall back to eager)"
+                )
+                continue
+            setattr(module, _ORIG_RVQ_DECODE_ATTR, decode)
+            module.decode = MethodType(_cuda_graph_rvq_decode, module)
+        elif name == "MimiConv1d":
+            if hasattr(module, _ORIG_CONV_FORWARD_ATTR):
+                continue
+            required = (
+                "kernel_size",
+                "stride",
+                "padding_total",
+                "padding_left",
+                "padding_right",
+                "conv",
+                "_pad1d",
+                "pad_mode",
+                "causal",
+            )
+            if not all(hasattr(module, attr) for attr in required):
+                logger.warning(
+                    "MimiConv1d layout unexpected; skipping CUDA-graph pad "
+                    "patch (capture may fall back to eager)"
+                )
+                continue
+            # Reading the int64 buffers syncs — legal HERE (patch time),
+            # illegal during capture; that is the whole point of the patch.
+            module._sglang_omni_kernel_size = int(module.kernel_size)
+            module._sglang_omni_stride = int(module.stride)
+            module._sglang_omni_padding_total = int(module.padding_total)
+            module._sglang_omni_padding_left = int(module.padding_left)
+            module._sglang_omni_padding_right = int(module.padding_right)
+            setattr(module, _ORIG_CONV_FORWARD_ATTR, module.forward)
+            module.forward = MethodType(_cuda_graph_conv1d_forward, module)
 
 
 class CsmMimiVocoderCudaGraphRunner:
@@ -115,6 +247,9 @@ class CsmMimiVocoderCudaGraphRunner:
             for _ in range(self._warmup_iters):
                 self._model.decode(static_codes)
         torch.cuda.current_stream().wait_stream(stream)
+        # Eager reference on the SAME static input for the post-capture
+        # replay self-check (current stream, before capture).
+        eager_ref = self._model.decode(static_codes).audio_values.detach().clone()
         torch.cuda.synchronize()
         # Shared mempool across the T graphs to bound memory; capture order
         # (largest T first) in warmup.
@@ -125,6 +260,11 @@ class CsmMimiVocoderCudaGraphRunner:
             graph, pool=self._pool, capture_error_mode="thread_local"
         ):
             static_audio = self._model.decode(static_codes).audio_values
+        # Boot-time bit-identity gate: a silently-empty capture (capture_end
+        # warns "The CUDA Graph is empty") replays as a no-op — catch it (and
+        # any non-bit-identical replay) HERE and raise so warmup drops this T
+        # to eager instead of shipping corrupt audio.
+        self._replay_self_check(graph.replay, static_audio, eager_ref)
         self._graphs[frame_count] = _CapturedVocoderGraph(
             graph=graph,
             static_codes=static_codes,
@@ -136,6 +276,35 @@ class CsmMimiVocoderCudaGraphRunner:
             tuple(static_audio.shape),
             len(self._graphs),
         )
+
+    @staticmethod
+    @torch.no_grad()
+    def _replay_self_check(
+        replay_fn, static_audio: torch.Tensor, eager_ref: torch.Tensor
+    ) -> None:
+        """Poison the static output with NaN, replay, and require
+        ``torch.equal`` with the eager reference for the SAME static input.
+
+        Catches (a) silently-EMPTY captures — wrong stream/device or a
+        swallowed in-capture error leaves zero recorded nodes, replay is a
+        no-op and the poison survives (the exact RTX 3060 failure mode this
+        guards) — and (b) any non-bit-identical replay. Callers drop the T
+        (→ eager) on failure. Device-agnostic on purpose so the CPU tier can
+        regression-test the no-op-replay mode with a stub ``replay_fn``."""
+        static_audio.fill_(float("nan"))
+        replay_fn()
+        if static_audio.is_cuda:
+            torch.cuda.synchronize()
+        if bool(torch.isnan(static_audio).any()):
+            raise RuntimeError(
+                "CUDA-graph replay left the static output poisoned — the "
+                "capture recorded no work (empty graph / wrong stream)"
+            )
+        if not torch.equal(static_audio, eager_ref):
+            raise RuntimeError(
+                "CUDA-graph replay is not bit-identical to the eager decode "
+                "of the same input"
+            )
 
     @torch.no_grad()
     def warmup(self, frames: Iterable[int]) -> None:
@@ -234,4 +403,4 @@ class CsmMimiVocoderCudaGraphRunner:
         return entry.static_audio
 
 
-__all__ = ["CsmMimiVocoderCudaGraphRunner"]
+__all__ = ["CsmMimiVocoderCudaGraphRunner", "patch_mimi_codec_for_cuda_graph"]
