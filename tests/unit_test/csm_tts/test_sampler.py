@@ -8,6 +8,7 @@ from __future__ import annotations
 import queue
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang_omni.models.csm_tts import sampler
@@ -248,6 +249,64 @@ def test_top_p_nucleus_keeps_top_token_and_excludes_tail() -> None:
     logits = torch.full((B, V), -10.0)
     logits[:, :3] = 10.0
     top_p = torch.full((B,), 0.9)
+    seen: set[int] = set()
+    for _ in range(200):
+        out = sampler.sample_codes_batched(logits, temp, topk, top_p)
+        seen.update(out.tolist())
+    assert seen and all(t < 3 for t in seen), f"tail token sampled: {sorted(seen)}"
+
+
+# ---------------------------------------------------------------------------
+# #816 fused top-k/top-p renorm path (CUDA + sgl_kernel only; the CPU tests
+# above pin the pure-torch fallback of the SAME contract)
+# ---------------------------------------------------------------------------
+
+_fused_reason = "needs CUDA + sgl_kernel (fused renorm kernels)"
+_fused_available = torch.cuda.is_available() and (
+    sampler._fused_top_k_renorm is not None
+)
+
+
+@pytest.mark.skipif(not _fused_available, reason=_fused_reason)
+def test_fused_topk_support_and_greedy_parity_cuda() -> None:
+    """Fused path honors the same per-row contract as the torch fallback:
+    greedy rows == argmax over RAW logits; sampled rows stay inside their
+    own temperature-scaled top-k support (mixed per-row k)."""
+    torch.manual_seed(11)
+    B = 4
+    logits = (torch.randn(B, K_MAX) * 4.0).cuda()
+    temps = torch.tensor([0.0, 0.9, 0.9, 0.9], device="cuda")
+    topks = torch.tensor([K_MAX, 50, 7, 1], dtype=torch.long, device="cuda")
+    argmax = logits.argmax(dim=-1)
+    for _ in range(20):
+        out = sampler.sample_codes_batched(logits, temps, topks)
+        # greedy short-circuits (temp=0 row 0; top_k=1 row 3) stay bit-exact
+        assert torch.equal(out[[0, 3]], argmax[[0, 3]])
+        for r, k in ((1, 50), (2, 7)):
+            scaled = logits[r] / 0.9
+            kth = scaled.topk(k).values[-1]
+            assert scaled[out[r]] >= kth, f"row {r} escaped top-{k} support"
+        assert ((out >= 0) & (out < K_MAX)).all()
+
+
+@pytest.mark.skipif(not _fused_available, reason=_fused_reason)
+def test_fused_top_p_nucleus_support_cuda() -> None:
+    """Fused nucleus keeps the dominant token and never samples the excluded
+    tail (same reference behavior the CPU test pins for the torch path)."""
+    B, V = 4, K_MAX
+    temp = torch.ones(B, device="cuda")
+    topk = torch.full((B,), K_MAX, dtype=torch.long, device="cuda")
+    # (a) one dominant token + tiny p -> nucleus collapses to the argmax.
+    logits = torch.full((B, V), -10.0, device="cuda")
+    logits[:, 3] = 10.0
+    top_p = torch.full((B,), 0.5, device="cuda")
+    for _ in range(64):
+        out = sampler.sample_codes_batched(logits, temp, topk, top_p)
+        assert torch.all(out == 3), out.tolist()
+    # (b) flat top-3 (logit 10) over a -10 tail -> samples stay within {0,1,2}.
+    logits = torch.full((B, V), -10.0, device="cuda")
+    logits[:, :3] = 10.0
+    top_p = torch.full((B,), 0.9, device="cuda")
     seen: set[int] = set()
     for _ in range(200):
         out = sampler.sample_codes_batched(logits, temp, topk, top_p)

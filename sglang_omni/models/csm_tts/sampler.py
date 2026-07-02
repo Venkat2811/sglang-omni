@@ -23,6 +23,19 @@ from sglang_omni.models.csm_tts.utils import (
     STOP_CODE,
 )
 
+# #816 fused top-k/top-p renormalization (higgs parity). sgl_kernel is
+# CUDA-only, so the import is resolved ONCE at module load; the pure-torch
+# path below stays as the CPU/no-kernel fallback. The in-function selection
+# is device-static (`.is_cuda` on the input), so under CUDA-graph capture the
+# branch resolves once at capture time — never data-dependent host control
+# flow inside the captured region.
+try:
+    from sgl_kernel import top_k_renorm_prob as _fused_top_k_renorm
+    from sgl_kernel import top_p_renorm_prob as _fused_top_p_renorm
+except ImportError:  # CPU dev box / no sgl_kernel wheel
+    _fused_top_k_renorm = None
+    _fused_top_p_renorm = None
+
 __all__ = [
     "CsmBatchedSamplerState",
     "K_MAX",
@@ -112,8 +125,14 @@ def sample_codes_batched(
     ``_sample_independent_batched`` with ``K_MAX=2051``).
 
     Greedy rows (``temperature <= 1e-5`` or ``top_k == 1``) short-circuit
-    branchlessly to argmax over RAW logits; sampled rows use a fixed-shape
-    ``topk(K_MAX)`` + per-row k-th-value gather (CG-deterministic at temp=0).
+    branchlessly to argmax over RAW logits. Sampled rows filter to the
+    top-k/nucleus support: on CUDA with sgl_kernel present that is the #816
+    fused ``top_k_renorm_prob``/``top_p_renorm_prob`` path
+    (softmax → renorm, no full-vocab sort); otherwise the pure-torch
+    fixed-shape ``topk(K_MAX)`` + per-row k-th-value gather and
+    sort-based nucleus (CG-deterministic at temp=0). Same support in both
+    paths; the fused path only differs at an exact cumsum==top_p boundary,
+    where it uses the standard nucleus convention (higgs PR-D note).
     Used for BOTH cb0 and every one of the 31 depth steps.
 
     Seeded rows (#824, higgs template): when ``seeds_B`` is given, rows with
@@ -147,30 +166,45 @@ def sample_codes_batched(
 
     safe_temp = temperature_B.clamp(min=_GREEDY_TEMP_THRESHOLD).view(B, 1)
     logits = logits_BV_fp32 / safe_temp
+    V = int(logits_BV_fp32.shape[-1])
 
-    # Fixed-shape top-k: always topk(full width) + per-row k-th-value gather.
-    # K_MAX (= 2051) in production; clamped to the logits width so tiny-config
-    # tests run the same code path. Still
-    # shape-static under CUDA-graph capture (V is fixed per graph).
-    k_width = min(K_MAX, int(logits_BV_fp32.shape[-1]))
-    top_vals = logits.topk(k_width, dim=-1).values
-    k_idx = top_k_buf_B.view(B, 1).clamp(min=1, max=k_width) - 1
-    kth = top_vals.gather(-1, k_idx)
-    logits = torch.where(logits < kth, float("-inf"), logits)
+    if _fused_top_k_renorm is not None and logits_BV_fp32.is_cuda:
+        # #816 fused path: softmax first, then top-k/top-p renormalization on
+        # probs (flashinfer kernels; identical support to the sort path,
+        # renormalized mass). Inputs MUST be contiguous fp32 (higgs parity).
+        probs = logits.softmax(dim=-1).contiguous()
+        tk = top_k_buf_B.clamp(min=1, max=V).to(torch.int32).contiguous()
+        probs = _fused_top_k_renorm(probs, tk)
+        if top_p_B is not None:
+            probs = _fused_top_p_renorm(
+                probs, top_p_B.to(torch.float32).contiguous()
+            )
+    else:
+        # Pure-torch fallback (CPU / no sgl_kernel). Fixed-shape top-k:
+        # always topk(full width) + per-row k-th-value gather. K_MAX
+        # (= 2051) in production; clamped to the logits width so
+        # tiny-config tests run the same code path. Still shape-static
+        # under CUDA-graph capture (V is fixed per graph).
+        k_width = min(K_MAX, V)
+        top_vals = logits.topk(k_width, dim=-1).values
+        k_idx = top_k_buf_B.view(B, 1).clamp(min=1, max=k_width) - 1
+        kth = top_vals.gather(-1, k_idx)
+        logits = torch.where(logits < kth, float("-inf"), logits)
 
-    if top_p_B is not None:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        cum_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-        remove = cum_probs > top_p_B.view(B, 1)
-        # Shift right + force-keep top token so the highest-prob token never
-        # gets cut.
-        remove[..., 1:] = remove[..., :-1].clone()
-        remove[..., 0] = False
-        scatter = torch.zeros_like(remove)
-        scatter.scatter_(-1, sorted_indices, remove)
-        logits = torch.where(scatter, float("-inf"), logits)
+        if top_p_B is not None:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cum_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            remove = cum_probs > top_p_B.view(B, 1)
+            # Shift right + force-keep top token so the highest-prob token
+            # never gets cut.
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            scatter = torch.zeros_like(remove)
+            scatter.scatter_(-1, sorted_indices, remove)
+            logits = torch.where(scatter, float("-inf"), logits)
 
-    probs = logits.softmax(dim=-1)
+        probs = logits.softmax(dim=-1)
+
     sampled_B = probs.multinomial(num_samples=1).squeeze(-1)
 
     if seeds_B is not None:
