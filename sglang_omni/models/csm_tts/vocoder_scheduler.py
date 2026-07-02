@@ -27,6 +27,17 @@ seam-free without crossfade. This STATELESS overlap-trim decode is the default;
 the optional stateful ``decoder_past_key_values`` path is mutually exclusive with
 overlap re-decode and stays gated on an A/B.
 
+CUDA graphs (default-ON; MOSS-TTS vocoder pattern, upstream #798/#886):
+at boot :meth:`CsmStreamingVocoderScheduler.warmup_now` captures one graph
+per streaming window length T at B=1 over the STATELESS
+``MimiModel.decode`` and attaches the sealed runner to the codec; every
+``codec.decode`` with a captured T replays bit-identically, everything else
+(uncaptured T, batched decodes, the optional stateful
+``decoder_past_key_values`` path, CPU boxes) serves eager. Escape hatch:
+``cuda_graph=False`` (ctor) or env ``CSM_VOCODER_CUDA_GRAPH=0``. See
+``vocoder_cuda_graph.py`` for the exact capture boundary and why the
+stateless path needs no MOSS-style cache patch.
+
 The three OOB fences: (1) engine never streams EOS/STOP frames;
 (2) ``sanitize_for_mimi`` clamp + counter on every matrix entering Mimi;
 (3) final flush / non-streaming trim at the first all-32-zero frame (HF
@@ -39,6 +50,7 @@ inconsistency exactly).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -68,6 +80,20 @@ __all__ = ["CsmStreamState", "CsmStreamingVocoderScheduler"]
 # num_codebooks/codebook_size fields — they're model constants).
 _NUM_CODEBOOKS = 32
 _CODEBOOK_VOCAB = 2051
+
+# Operator escape hatch for the vocoder CUDA graphs (the ctor toggle is not
+# reachable from YAML yet — create_vocoder_executor's signature is frozen this
+# pass). Default ON; set CSM_VOCODER_CUDA_GRAPH=0 to serve eager.
+_CUDA_GRAPH_ENV = "CSM_VOCODER_CUDA_GRAPH"
+
+
+def _env_cuda_graph_enabled() -> bool:
+    return os.environ.get(_CUDA_GRAPH_ENV, "1").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
 
 
 @dataclass
@@ -99,17 +125,34 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         stream_holdback_frames: int = 2,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
+        cuda_graph: bool = True,
+        cuda_graph_frames: list[int] | None = None,
+        cuda_graph_min_free_gb: float = 1.0,
     ) -> None:
         """Validate knobs, hold the shared :class:`CsmMimiCodec`, init the
         per-request ``_stream_states`` dict, then ``super().__init__(
         self._vocode_payload, batch_compute_fn=self._vocode_payloads,
-        max_batch_size=..., max_batch_wait_ms=...)`` (higgs ctor shape)."""
+        max_batch_size=..., max_batch_wait_ms=...)`` (higgs ctor shape),
+        then :meth:`warmup_now` (boot-time CUDA-graph capture; no-op off
+        CUDA / when toggled off)."""
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream_stride and stream_followup_stride must be > 0")
         if stream_overlap_frames < 0:
             raise ValueError("stream_overlap_frames must be >= 0")
         if stream_holdback_frames < 0:
             raise ValueError("stream_holdback_frames must be >= 0")
+        if cuda_graph_min_free_gb < 0:
+            raise ValueError(
+                "cuda_graph_min_free_gb must be >= 0 (0 disables the VRAM "
+                f"headroom guard); got {cuda_graph_min_free_gb}"
+            )
+        if cuda_graph_frames is not None:
+            invalid = [t for t in cuda_graph_frames if int(t) < 1]
+            if not cuda_graph_frames or invalid:
+                raise ValueError(
+                    "cuda_graph_frames must be a non-empty list of positive "
+                    f"ints (>= 1); got {cuda_graph_frames}"
+                )
 
         self._codec = codec
         self._stream_stride = int(stream_stride)
@@ -120,6 +163,13 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._samples_per_frame = CsmMimiCodec.SAMPLES_PER_FRAME
         self._stream_states: dict[str, CsmStreamState] = {}
         self._clamp_count_total = 0  # process-wide fence-#2 counter
+        # Effective toggle = ctor AND env (env is the operator escape hatch).
+        self._cuda_graph = bool(cuda_graph) and _env_cuda_graph_enabled()
+        self._cuda_graph_frames = (
+            sorted({int(t) for t in cuda_graph_frames}) if cuda_graph_frames else None
+        )
+        self._cuda_graph_min_free_gb = float(cuda_graph_min_free_gb)
+        self._cuda_graph_warmup_attempted = False
 
         super().__init__(
             self._vocode_payload,
@@ -127,6 +177,7 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
         )
+        self.warmup_now()
 
     # --- StreamingSimpleScheduler hooks ---------------------------------------
 
@@ -239,6 +290,95 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         ``past_key_values`` — the cross-request state-leak guard (abort path
         calls this too)."""
         self._stream_states.pop(request_id, None)
+
+    # --- CUDA-graph warmup (MOSS #798/#886 pattern) -----------------------------
+
+    def warmup_now(self) -> None:
+        """Boot-time capture: build the runner, capture every T in
+        :meth:`_cuda_graph_capture_frames`, seal, attach to the codec — never
+        lazily in the serving loop (MOSS discipline: warmup → capture →
+        seal). Attempted at most once; a no-op when the toggle is off or the
+        codec is not a CUDA :class:`CsmMimiCodec` (CPU boxes and unit-test
+        mock codecs serve eager). Capture failures degrade to eager, never
+        crash boot."""
+        if self._cuda_graph_warmup_attempted:
+            return
+        self._cuda_graph_warmup_attempted = True
+        if not self._cuda_graph or not self._codec_on_cuda():
+            return
+        from sglang_omni.models.csm_tts.vocoder_cuda_graph import (
+            CsmMimiVocoderCudaGraphRunner,
+        )
+
+        frames = self._cuda_graph_capture_frames()
+        runner = CsmMimiVocoderCudaGraphRunner(
+            self._codec.model,
+            num_codebooks=_NUM_CODEBOOKS,
+            max_frames=max(frames),
+            min_free_gb=self._cuda_graph_min_free_gb,
+        )
+        try:
+            runner.warmup(frames)
+        except Exception:
+            logger.exception(
+                "CSM vocoder CUDA-graph warmup failed; serving eager"
+            )
+            return
+        if not runner.captured_frames():
+            # Nothing captured (low VRAM / all captures failed): do not
+            # attach, so serving skips the wasted per-decode replay probe.
+            logger.warning(
+                "CSM vocoder CUDA graphs: nothing captured; serving eager"
+            )
+            return
+        self._codec.set_cuda_graph_runner(runner)
+
+    def _codec_on_cuda(self) -> bool:
+        """True only for a real CUDA-resident :class:`CsmMimiCodec` (unit
+        tests pass mock codecs without ``device``/``model``)."""
+        if not torch.cuda.is_available():
+            return False
+        device = getattr(self._codec, "device", None)
+        return (
+            getattr(device, "type", None) == "cuda"
+            and getattr(self._codec, "model", None) is not None
+            and callable(getattr(self._codec, "set_cuda_graph_runner", None))
+        )
+
+    def _cuda_graph_capture_frames(self) -> list[int]:
+        """Window lengths T to capture. ``cuda_graph_frames`` overrides;
+        the default is the CONTIGUOUS ``1..max_streaming_window`` (post-#886
+        discipline: no in-range streaming step silently goes eager)."""
+        if self._cuda_graph_frames:
+            return list(self._cuda_graph_frames)
+        return list(range(1, self._max_streaming_window() + 1))
+
+    def _max_streaming_window(self) -> int:
+        """Upper bound on every decode window ``_decode_delta`` can produce
+        (T = emit_until - window_start; rows arrive one per engine step, so
+        emission fires exactly when ``available == need``):
+
+        - first default chunk: ``stride - holdback`` (window starts at 0);
+        - first-chunk TTFA knob: ``initial <= stride - 1``;
+        - steady chunk: ``followup + overlap``;
+        - post-initial chunk: ``<= followup + overlap``;
+        - final flush, nothing emitted: ``available <= stride - 1`` (one
+          more row would have emitted) → ``T <= stride - 1``;
+        - final flush after emitting: ``available <= emitted + followup +
+          holdback - 1`` → ``T <= followup + holdback + overlap - 1``.
+
+        Non-streaming full-utterance decodes (up to the 125-frame cap) are
+        NOT bounded by this and intentionally serve eager."""
+        return max(
+            self._stream_stride - self._stream_holdback_frames,
+            self._stream_stride - 1,
+            self._stream_followup_stride + self._stream_overlap_frames,
+            self._stream_followup_stride
+            + self._stream_holdback_frames
+            + self._stream_overlap_frames
+            - 1,
+            1,
+        )
 
     # --- latch helpers ----------------------------------------------------------
 

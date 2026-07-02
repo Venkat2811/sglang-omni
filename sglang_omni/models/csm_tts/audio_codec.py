@@ -10,6 +10,13 @@ fp32 BY DEFAULT (conv-transpose decode stability; bf16 opt-in). Mimi runs at
 clamped before any Mimi call (hard SIGSEGV-class hazard on some kernels,
 garbage on others).
 
+The stateless :meth:`CsmMimiCodec.decode` path can replay boot-captured CUDA
+graphs when the vocoder stage attaches a
+:class:`~sglang_omni.models.csm_tts.vocoder_cuda_graph.CsmMimiVocoderCudaGraphRunner`
+(see that module for the capture boundary); uncaptured shapes and any replay
+failure fall back to the eager ``MimiModel.decode`` (stateless ⇒ the eager
+retry is value-safe).
+
 
 """
 
@@ -154,6 +161,14 @@ class CsmMimiCodec:
         # Process-wide sanitize telemetry (fence #2); the vocoder additionally
         # tracks per-request counts. Gate-able only at temp=0.
         self.clamp_count = 0
+        # Optional CUDA-graph replay runner for the STATELESS decode path
+        # (vocoder_cuda_graph.CsmMimiVocoderCudaGraphRunner). None => eager.
+        # The vocoder scheduler owns capture policy/warmup and attaches it.
+        self._cg_runner: Any | None = None
+        # Host-side hit/miss telemetry for GPU validation (misses only count
+        # decodes attempted while a runner was attached).
+        self.cg_decode_hits = 0
+        self.cg_decode_misses = 0
 
     @classmethod
     def from_pretrained(
@@ -209,6 +224,16 @@ class CsmMimiCodec:
             p.requires_grad_(False)
         return cls(model, device=device, dtype=dtype)
 
+    def set_cuda_graph_runner(self, runner: Any | None) -> None:
+        """Attach a sealed
+        :class:`~sglang_omni.models.csm_tts.vocoder_cuda_graph.CsmMimiVocoderCudaGraphRunner`
+        (or ``None`` to force eager). Called by the vocoder scheduler's
+        ``warmup_now`` after boot-time capture."""
+        self._cg_runner = runner
+
+    def has_cuda_graph_runner(self) -> bool:
+        return self._cg_runner is not None
+
     @torch.no_grad()
     def encode_reference(self, wav_11S: torch.Tensor, sample_rate: int) -> torch.Tensor:
         """Encode one context waveform to Mimi codes.
@@ -247,7 +272,9 @@ class CsmMimiCodec:
         """Decode a code matrix to a waveform (stateless path).
 
         Transposes to ``[1, 32, F]``, applies the :func:`sanitize_for_mimi`
-        clamp guard, decodes.
+        clamp guard, decodes — replaying a boot-captured CUDA graph when one
+        is attached and covers this ``F`` (bit-identical bar; eager
+        otherwise).
 
         Args:
             codes_F32: int64 ``[F, 32]``.
@@ -259,7 +286,7 @@ class CsmMimiCodec:
         codes = codes_F32.detach().to(torch.long).clone()
         codes = self._sanitize_counted(codes, "decode")
         codes_B32F = _to_codes_B32F(codes, self.device)
-        wave = self.model.decode(codes_B32F).audio_values.squeeze(0)
+        wave = self._decode_waveform(codes_B32F)
         return self._exact_frames(wave, int(codes.shape[0])).to(torch.float32).cpu()
 
     @torch.no_grad()
@@ -334,6 +361,42 @@ class CsmMimiCodec:
         return wave.to(torch.float32).cpu(), out.decoder_past_key_values
 
     # --- internals ------------------------------------------------------------
+
+    def _decode_waveform(self, codes_B32F: torch.Tensor) -> torch.Tensor:
+        """Stateless decode of sanitized ``[1, 32, F]`` codes with a
+        CUDA-graph replay fast path.
+
+        The replay AND the D2H copy stay inside one guard — a replay error
+        can surface asynchronously on the copy (MOSS discipline). Any
+        graph-path failure permanently disables the runner and this call
+        (and every later one) retries EAGER: unlike MOSS's stateful session,
+        which must abort its participants, CSM's stateless decode makes the
+        eager retry value-safe.
+
+        Returns:
+            float ``[1, S]`` — on CPU when replayed, on ``self.device`` when
+            eager (both are normalized by the caller's ``.cpu()``).
+        """
+        runner = self._cg_runner
+        if runner is not None:
+            try:
+                static_audio = runner.decode(codes_B32F)
+                if static_audio is not None:
+                    # Consume the STATIC buffer before any later replay can
+                    # overwrite it: one D2H copy, still inside the guard.
+                    wave = static_audio.squeeze(0).detach().to(
+                        "cpu", torch.float32, copy=True
+                    )
+                    self.cg_decode_hits += 1
+                    return wave
+            except Exception:
+                self._cg_runner = None
+                logger.exception(
+                    "CSM Mimi vocoder CUDA-graph replay failed; runner "
+                    "disabled — decoding EAGER from here on"
+                )
+            self.cg_decode_misses += 1
+        return self.model.decode(codes_B32F).audio_values.squeeze(0)
 
     def _sanitize_counted(self, codes: torch.Tensor, where: str) -> torch.Tensor:
         codes, num_clamped = sanitize_for_mimi(codes)
