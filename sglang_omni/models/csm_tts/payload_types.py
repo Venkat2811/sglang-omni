@@ -14,9 +14,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from sglang_omni.scheduling.pipeline_state import PipelineStateBase
+
 
 @dataclass
-class CsmTtsState:
+class CsmTtsState(PipelineStateBase):
     """State threaded through preprocessing → audio_encoder → tts_engine →
     vocoder.
 
@@ -26,7 +28,18 @@ class CsmTtsState:
     position, exactly like HF); ``output_frames`` is a list of ``[32]``
     int rows and INCLUDES the EOS frame (HF ``sequences`` parity — the
     vocoder never receives it).
+
+    Usage fields (``prompt_tokens`` / ``completion_tokens`` /
+    ``engine_time_s`` / ``sample_rate``) are inherited from
+    :class:`PipelineStateBase` (#807). Frames stay the CSM source of truth:
+    ``completion_frames`` is the model-native counter and the result adapter
+    mirrors it into the base ``completion_tokens`` (1 frame = 1 backbone
+    position = 1 SGLang "token") so shared usage reporting works.
     """
+
+    # Re-declared only to keep the default explicit (Mimi runs at 24 kHz,
+    # matching the base default).
+    sample_rate: int = 24000
 
     # preprocessing
     text: str | None = None
@@ -50,16 +63,14 @@ class CsmTtsState:
 
     # tts_engine outputs
     output_frames: list[Any] | None = None  # list of [32] int rows
-    prompt_tokens: int = 0
-    completion_frames: int = 0
-    engine_time_s: float = 0.0
+    completion_frames: int = 0  # model-native; mirrored into completion_tokens
     # "stop" = natural EOS frame; "length" = frame cap hit, output truncated
     # mid-utterance (CSM-1B does not terminate on a fraction of prompts).
     finish_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise for ``StagePayload.data`` (sparse: omit None/empty;
-        higgs pattern)."""
+        higgs pattern; usage via the shared ``append_usage_fields``)."""
         data: dict[str, Any] = {
             "speaker_id": self.speaker_id,
             "prompt_ids": list(self.prompt_ids),
@@ -68,6 +79,7 @@ class CsmTtsState:
             "top_k": self.top_k,
             "depth_temperature": self.depth_temperature,
             "depth_top_k": self.depth_top_k,
+            "sample_rate": self.sample_rate,
         }
         if self.text is not None:
             data["text"] = self.text
@@ -87,10 +99,9 @@ class CsmTtsState:
             data["output_frames"] = self.output_frames
         if self.finish_reason is not None:
             data["finish_reason"] = self.finish_reason
-        for key in ("prompt_tokens", "completion_frames", "engine_time_s"):
-            value = getattr(self, key)
-            if value:
-                data[key] = value
+        if self.completion_frames:
+            data["completion_frames"] = self.completion_frames
+        self.append_usage_fields(data)
         return data
 
     @classmethod
@@ -112,10 +123,12 @@ class CsmTtsState:
             seed=data.get("seed"),
             stream=data.get("stream", False),
             output_frames=data.get("output_frames"),
-            prompt_tokens=data.get("prompt_tokens", 0),
             completion_frames=data.get("completion_frames", 0),
-            engine_time_s=data.get("engine_time_s", 0.0),
             finish_reason=data.get("finish_reason"),
+            sample_rate=int(data.get("sample_rate", 24000)),
+            prompt_tokens=int(data.get("prompt_tokens", 0)),
+            completion_tokens=int(data.get("completion_tokens", 0)),
+            engine_time_s=float(data.get("engine_time_s", 0.0)),
         )
 
 

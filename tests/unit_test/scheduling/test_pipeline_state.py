@@ -84,6 +84,7 @@ def test_serialize_value_detaches_tensor_to_cpu() -> None:
 def test_tts_pipeline_states_share_base_usage_contract() -> None:
     import dataclasses
 
+    from sglang_omni.models.csm_tts.payload_types import CsmTtsState
     from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
     from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
     from sglang_omni.models.moss_tts.payload_types import MossTTSState
@@ -93,6 +94,7 @@ def test_tts_pipeline_states_share_base_usage_contract() -> None:
 
     # Every in-scope TTS model routes its state through PipelineStateBase.
     state_classes = (
+        CsmTtsState,
         S2ProState,
         HiggsTtsState,
         MossTTSState,
@@ -140,6 +142,7 @@ def _assert_round_trip_preserves_payload(state: PipelineStateBase) -> None:
 
 
 def test_tts_pipeline_state_round_trips_preserve_payload_fields() -> None:
+    from sglang_omni.models.csm_tts.payload_types import CsmTtsState
     from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
     from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
     from sglang_omni.models.moss_tts.payload_types import MossTTSState
@@ -148,6 +151,28 @@ def test_tts_pipeline_state_round_trips_preserve_payload_fields() -> None:
     from sglang_omni.models.voxtral_tts.io import VoxtralTTSState
 
     states = [
+        CsmTtsState(
+            text="hello",
+            speaker_id=1,
+            context=[{"speaker_id": 0, "text": "ref"}],
+            prompt_ids=[1, 2, 3],
+            context_codes=[[[1] * 32, [2] * 32]],
+            num_ctx_codes_consumed=2,
+            max_new_tokens=10,
+            temperature=0.7,
+            top_k=40,
+            top_p=0.95,
+            depth_temperature=0.8,
+            depth_top_k=30,
+            seed=42,
+            stream=True,
+            output_frames=[[5] * 32, [0] * 32],
+            completion_frames=2,
+            finish_reason="stop",
+            prompt_tokens=3,
+            completion_tokens=2,
+            engine_time_s=0.125,
+        ),
         S2ProState(
             input_ids=[1, 2, 3],
             vq_mask_tokens=[False, True, False],

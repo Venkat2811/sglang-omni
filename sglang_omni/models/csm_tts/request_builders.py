@@ -29,6 +29,7 @@ from sglang_omni.models.csm_tts.utils import (
 )
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import load_state
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
 _TEXT_VOCAB_SIZE = 128_256
@@ -219,6 +220,9 @@ def apply_csm_result(state: CsmTtsState, data: CsmSGLangRequestData) -> None:
     else:
         state.output_frames = None
         state.completion_frames = 0
+    # Frames are the source of truth; the shared PipelineStateBase usage
+    # contract counts completion_tokens (1 frame = 1 backbone position).
+    state.completion_tokens = state.completion_frames
     state.prompt_tokens = len(data.input_ids)
     state.finish_reason = "stop" if data.generation_done else "length"
     if not data.generation_done and state.completion_frames:
@@ -258,7 +262,7 @@ def make_csm_scheduler_adapters(
     """
 
     def request_builder(payload: StagePayload) -> CsmSGLangRequestData:
-        state = CsmTtsState.from_dict(payload.data)
+        state = load_state(payload, CsmTtsState)
         frame_budget = BACKBONE_CTX - 1 - len(state.prompt_ids)
         if frame_budget < 1:
             raise ValueError(
@@ -280,7 +284,7 @@ def make_csm_scheduler_adapters(
 
     def result_adapter(data: CsmSGLangRequestData) -> StagePayload:
         payload = data.stage_payload
-        state = CsmTtsState.from_dict(payload.data)
+        state = load_state(payload, CsmTtsState)
         apply_csm_result(state, data)
         if data.engine_start_s:
             state.engine_time_s = time.perf_counter() - data.engine_start_s

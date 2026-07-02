@@ -56,6 +56,7 @@ from sglang_omni.models.tts_streaming import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.pipeline_state import build_usage, load_state
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 
 logger = logging.getLogger(__name__)
@@ -217,7 +218,7 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
             "modality": "audio",
             "sample_rate": self._sample_rate,
         }
-        usage = self._build_usage(CsmTtsState.from_dict(payload.data))
+        usage = self._build_usage(load_state(payload, CsmTtsState))
         if usage is not None:
             final_data["usage"] = usage
         messages.append(
@@ -423,7 +424,7 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         frame)."""
         if not isinstance(payload.data, dict):
             return None
-        codes = self._frames_to_codes(CsmTtsState.from_dict(payload.data).output_frames)
+        codes = self._frames_to_codes(load_state(payload, CsmTtsState).output_frames)
         if codes is None:
             return None
         codes, num_clamped = sanitize_for_mimi(codes)
@@ -450,7 +451,7 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
         ``output_frames``)."""
         items: list[tuple[CsmTtsState, torch.Tensor | None]] = []
         for payload in payloads:
-            state = CsmTtsState.from_dict(payload.data)
+            state = load_state(payload, CsmTtsState)
             codes = self._frames_to_codes(state.output_frames)
             if codes is not None:
                 codes, num_clamped = sanitize_for_mimi(codes)
@@ -514,16 +515,10 @@ class CsmStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     @staticmethod
     def _build_usage(state: CsmTtsState) -> dict[str, Any] | None:
-        """Usage dict for the terminal result (prompt_tokens,
-        completion_frames, engine_time_s)."""
-        if not (state.prompt_tokens or state.completion_frames or state.engine_time_s):
-            return None
-        usage: dict[str, Any] = {
-            "prompt_tokens": state.prompt_tokens,
-            "completion_tokens": state.completion_frames,  # 1 frame = 1 token
-            "completion_frames": state.completion_frames,
-            "total_tokens": state.prompt_tokens + state.completion_frames,
-        }
-        if state.engine_time_s:
-            usage["engine_time_s"] = round(state.engine_time_s, 6)
+        """Shared PipelineStateBase usage dict (#807) plus CSM's
+        model-native ``completion_frames`` (== completion_tokens; 1 frame =
+        1 backbone position)."""
+        usage = build_usage(state)
+        if usage is not None:
+            usage["completion_frames"] = state.completion_frames
         return usage

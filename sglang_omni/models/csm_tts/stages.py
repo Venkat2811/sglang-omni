@@ -45,6 +45,7 @@ from sglang_omni.preprocessing.cache_key import hash_bytes, hash_media_item
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.pipeline_state import load_state, store_state
 from sglang_omni.scheduling.sglang_backend import (
     SGLangOutputProcessor,
     build_sglang_server_args,
@@ -350,8 +351,7 @@ def create_preprocessing_executor(
             seed=params.get("seed"),
             stream=bool(params.get("stream", False)),
         )
-        payload.data = state.to_dict()
-        return payload
+        return store_state(payload, state)
 
     return ThreadedSimpleScheduler(_preprocess, max_concurrency=max_concurrency)
 
@@ -387,7 +387,7 @@ def create_audio_encoder_executor(
     )
 
     def _encode(payload: StagePayload) -> StagePayload:
-        state = CsmTtsState.from_dict(payload.data)
+        state = load_state(payload, CsmTtsState)
         if state.prompt_ids:
             return payload  # fast path: prompt already assembled upstream
 
@@ -426,8 +426,7 @@ def create_audio_encoder_executor(
         )
         state.prompt_ids = prompt_ids
         state.context_codes = context_codes
-        payload.data = state.to_dict()
-        return payload
+        return store_state(payload, state)
 
     return SimpleScheduler(
         _encode,

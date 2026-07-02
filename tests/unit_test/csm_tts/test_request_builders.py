@@ -117,6 +117,9 @@ def test_result_adapter_writes_usage_and_resets() -> None:
     assert resets == ["req-x"]
     state = CsmTtsState.from_dict(out.data)
     assert state.completion_frames == 1
+    # Base usage contract (#807): 1 frame = 1 backbone position = 1 token,
+    # so the shared completion_tokens mirrors the frame count.
+    assert state.completion_tokens == state.completion_frames == 1
     assert state.prompt_tokens == 5
     assert state.output_frames == [list(range(32))]
     assert state.engine_time_s > 0
