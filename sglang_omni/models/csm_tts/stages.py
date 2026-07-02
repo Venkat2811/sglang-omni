@@ -44,6 +44,10 @@ from sglang_omni.models.csm_tts.vocoder_scheduler import CsmStreamingVocoderSche
 from sglang_omni.preprocessing.cache_key import hash_bytes, hash_media_item
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
+from sglang_omni.scheduling.generation_batch_policy import (
+    build_generation_batch_overrides,
+    validate_generation_batch_policy,
+)
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.pipeline_state import load_state, store_state
 from sglang_omni.scheduling.sglang_backend import (
@@ -447,12 +451,17 @@ def create_sglang_tts_engine_executor(
     """SGLang-backed frame-AR engine (the-contract recipe).
 
     Recipe: ``resolve_checkpoint`` →
-    ``build_sglang_server_args(checkpoint_dir, context_length=2048,
-    disable_cuda_graph=True (eager; set False to enable CUDA graphs), cuda_graph_max_bs=8,
-    mem_fraction_static=0.5, max_running_requests=8,
-    chunked_prefill_size=2048, dtype="bfloat16", **overrides)`` →
+    ``build_generation_batch_overrides(max_running_requests=8,
+    cuda_graph_max_bs=8, disable_cuda_graph=True (eager; set False to enable
+    CUDA graphs), mem_fraction_static=0.5, chunked_prefill_size=2048,
+    dtype="bfloat16")`` (#843: ties the batch knobs + explicit
+    ``cuda_graph_bs``) → ``build_sglang_server_args(checkpoint_dir,
+    context_length=2048, **overrides)`` →
     ``server_args.disable_overlap_schedule = True`` (contract-required) →
-    ``create_sglang_infrastructure`` → ``CsmTTSModelRunner(model_worker,
+    ``create_sglang_infrastructure`` →
+    ``validate_generation_batch_policy(model_buffer_bs=
+    model.sampler_pool_max_running_requests)`` (#843 fail-loud boot check) →
+    ``CsmTTSModelRunner(model_worker,
     SGLangOutputProcessor(capture_hidden=False, ...))`` →
     ``make_csm_scheduler_adapters`` → ``OmniScheduler(...,
     abort_callback=model.reset_request)`` →
@@ -469,21 +478,23 @@ def create_sglang_tts_engine_executor(
     checkpoint_dir = resolve_checkpoint(model_path)
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
-    overrides: dict[str, Any] = {
-        # Eager by default (correctness baseline); set disable_cuda_graph=False to enable CUDA graphs with
-        # the captured backbone+cb0+depth step.
-        "disable_cuda_graph": True,
-        "cuda_graph_max_bs": DEFAULT_MAX_CONCURRENCY,
-        "mem_fraction_static": 0.5,
-        "max_running_requests": DEFAULT_MAX_CONCURRENCY,
-        "chunked_prefill_size": 2048,
-        "dtype": "bfloat16",
+    # #843 generation batch policy: max_running_requests / cuda_graph_max_bs /
+    # cuda_graph_bs / torch_compile_max_bs are tied together explicitly (the
+    # policy validator below rejects implicit or inconsistent combinations).
+    overrides = build_generation_batch_overrides(
+        max_running_requests=DEFAULT_MAX_CONCURRENCY,
+        cuda_graph_max_bs=DEFAULT_MAX_CONCURRENCY,
+        server_args_overrides=server_args_overrides,
+        # Eager by default (correctness baseline); set disable_cuda_graph=False
+        # to enable CUDA graphs with the captured backbone+cb0+depth step.
+        disable_cuda_graph=True,
+        mem_fraction_static=0.5,
+        chunked_prefill_size=2048,
+        dtype="bfloat16",
         # Radix cache is namespaced per context audio via Req.extra_key (set
         # in build_sglang_csm_request); identical 128002xF placeholder
         # prefixes from different voices can't cross-contaminate the KV tree.
-    }
-    if server_args_overrides:
-        overrides.update(server_args_overrides)
+    )
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
@@ -528,6 +539,13 @@ def create_sglang_tts_engine_executor(
     )
     model_runner = CsmTTSModelRunner(model_worker, output_proc)
     model = model_worker.model_runner.model
+    # #843: fail loudly at boot if the batch knobs and the model's sampler
+    # pool can't serve peak concurrency (higgs stages.py wiring).
+    validate_generation_batch_policy(
+        model_name="CSM TTS",
+        server_args=server_args,
+        model_buffer_bs=model.sampler_pool_max_running_requests,
+    )
     request_builder, result_adapter = make_csm_scheduler_adapters(
         model,
         max_new_tokens_cap=max_new_tokens,

@@ -215,6 +215,13 @@ class CsmTTSModel(nn.Module):
     def codebook_vocab_size(self) -> int:
         return self._codebook_vocab
 
+    @property
+    def sampler_pool_max_running_requests(self) -> int:
+        """Usable sampler-pool rows (pool_size - 1 reserved padding row);
+        fed to validate_generation_batch_policy as model_buffer_bs (#843,
+        higgs template)."""
+        return self._max_batch_size
+
     # --- sampler-pool row lifecycle (higgs verbatim) -------------------------
 
     def acquire_row(self, req_id: str) -> int:
