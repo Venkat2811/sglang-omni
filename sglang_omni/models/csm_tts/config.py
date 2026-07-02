@@ -60,8 +60,13 @@ class CsmTtsPipelineConfig(PipelineConfig):
         # stages.create_sglang_tts_engine_executor pins the 3060 budget from
         # the VRAM table — context_length=2048, mem_fraction_static
         # 0.5, cuda_graph_max_bs 8, dtype bfloat16, and disable_cuda_graph=
-        # True (eager is the correctness baseline; set False to enable CUDA graphs). The
-        # YAML's server_args_overrides deep-merge over those defaults.
+        # True. NOTE: engine CUDA graphs are NOT implemented for CSM's frame
+        # step — flipping disable_cuda_graph does not capture the
+        # backbone+cb0+depth tail (TODO pointers: model.py
+        # decode_codebooks_batch_cg, modeling.py module docstring). The Mimi
+        # vocoder is a separate CUDA-graph surface owned by the vocoder
+        # stage. The YAML's server_args_overrides deep-merge over those
+        # defaults.
         StageConfig(
             name="tts_engine",
             process="pipeline",

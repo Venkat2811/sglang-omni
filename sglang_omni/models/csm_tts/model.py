@@ -370,7 +370,11 @@ class CsmTTSModel(nn.Module):
         ``_cg_was_done`` / ``_cg_active_*``. No host control flow, no D2H.
 
         TODO: capture this whole tail (together with the backbone forward)
-        as one CUDA graph per batch size — eager-only for now.
+        as one CUDA graph per batch size — NOT implemented: this tail runs
+        eager only, and stages.py's ``disable_cuda_graph`` toggle does not
+        change that (SGLang's generic capture never reaches this private
+        tail). The Mimi vocoder's CUDA graphs are a separate surface owned
+        by the vocoder stage.
 
         Args:
             hidden_BD: bf16 ``[bs, 2048]`` post-norm backbone hidden.

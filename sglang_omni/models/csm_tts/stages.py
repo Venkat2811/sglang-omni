@@ -452,11 +452,12 @@ def create_sglang_tts_engine_executor(
 
     Recipe: ``resolve_checkpoint`` →
     ``build_generation_batch_overrides(max_running_requests=8,
-    cuda_graph_max_bs=8, disable_cuda_graph=True (eager; set False to enable
-    CUDA graphs), mem_fraction_static=0.5, chunked_prefill_size=2048,
-    dtype="bfloat16")`` (#843: ties the batch knobs + explicit
-    ``cuda_graph_bs``) → ``build_sglang_server_args(checkpoint_dir,
-    context_length=2048, **overrides)`` →
+    cuda_graph_max_bs=8, disable_cuda_graph=True (engine capture is a TODO;
+    see the overrides comment below), mem_fraction_static=0.5,
+    chunked_prefill_size=2048, dtype="bfloat16")`` (#843: ties the batch
+    knobs + explicit ``cuda_graph_bs``) →
+    ``build_sglang_server_args(checkpoint_dir, context_length=2048,
+    **overrides)`` →
     ``server_args.disable_overlap_schedule = True`` (contract-required) →
     ``create_sglang_infrastructure`` →
     ``validate_generation_batch_policy(model_buffer_bs=
@@ -485,8 +486,14 @@ def create_sglang_tts_engine_executor(
         max_running_requests=DEFAULT_MAX_CONCURRENCY,
         cuda_graph_max_bs=DEFAULT_MAX_CONCURRENCY,
         server_args_overrides=server_args_overrides,
-        # Eager by default (correctness baseline); set disable_cuda_graph=False
-        # to enable CUDA graphs with the captured backbone+cb0+depth step.
+        # Engine CUDA graphs are NOT implemented for CSM: capturing the
+        # backbone+cb0+depth frame step is an explicit TODO (model.py
+        # ``decode_codebooks_batch_cg`` docstring, modeling.py module
+        # docstring), and SGLang's generic capture never reaches CSM's
+        # private decode tail — so flipping disable_cuda_graph=False does
+        # NOT graph the frame step today; the engine runs eager either way.
+        # The Mimi vocoder is a separate CUDA-graph surface owned by the
+        # vocoder stage (create_vocoder_executor).
         disable_cuda_graph=True,
         mem_fraction_static=0.5,
         chunked_prefill_size=2048,

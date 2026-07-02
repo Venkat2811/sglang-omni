@@ -5,10 +5,13 @@
 dense depth decoder (4L, static 33-position KV, 31-step inner AR).
 
 These compose with an SGLang ``LlamaForCausalLM`` backbone in
-:class:`sglang_omni.models.csm_tts.model.CsmTTSModel`. Everything here is
-plain eager torch with static shapes, CUDA-graph-friendly (capture is not
-yet wired; eager by default): the 31-iteration host loop unrolls at capture
-with no data-dependent branches.
+:class:`sglang_omni.models.csm_tts.model.CsmTTSModel`. Everything here runs
+EAGER today — engine-side CUDA-graph capture of the backbone+cb0+depth
+frame step is an explicit TODO (``model.py`` ``decode_codebooks_batch_cg``
+docstring; ``stages.py`` keeps ``disable_cuda_graph=True``, and flipping it
+does not capture this step). The modules are written capture-READY (static
+shapes; the 31-iteration host loop would unroll at capture with no
+data-dependent branches), but no graph is captured here yet.
 
 
 """
